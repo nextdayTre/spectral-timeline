@@ -14,11 +14,23 @@ import {
 } from "./dsp.js";
 import { FAS_SYNTH_METHODS, FasClient } from "./fas_client.js";
 import {
+  buildPlasmaShowreelSequence,
   buildSecp256k1BreathingCards,
   buildShapeMorphSequence,
   renderGeometricTestRGBA,
   renderUniformPixelBoxRGBA,
 } from "./glyph_grid.js";
+import {
+  CARTRIDGE_SCHEMA,
+  CARTRIDGE_TEXT_KEY,
+  attachId3v2ToMp3,
+  decodeLayer2FromCoverRGBA,
+  encodeAudioToMp3,
+  extractPngTextChunks,
+  injectPngTextChunk,
+  parseApicFromMp3,
+  renderCartridgeCoverRGBA,
+} from "./mp3_cartridge.js";
 
 const MAX_CLIPS = 256;
 const HI_RES_W = 240;
@@ -120,10 +132,23 @@ const app = {
   seams: [],
   seamCanvases: [],
 
-  // Optional offline WAV artifacts
+  // Optional offline WAV & MP3 Cartridge artifacts
   masterSpecCanvas: null,
   masterWavUrl: null,
   audioBuffer: null,
+  lastAudioF32: null,
+  lastAudioSr: 48000,
+  blurryMp3Buffer: null,
+  apicCoverCanvas: null,
+  cartridgeLayer: "",
+  abSource: "expanded", // "expanded" | "mp3"
+  activeRecipe: {
+    type: "secp256k1",
+    kRaw: "1",
+    count: 1,
+    alignMode: "66_header",
+    bandMode: "full",
+  },
 
   // View & transport state
   monMode: "timeline", // "timeline" | "clip" | "seam" | "video" | "master"
@@ -509,6 +534,32 @@ function startPlayback(offsetSec = null) {
   const dur = totalDurationS();
   const off = offsetSec !== null ? Math.max(0, Math.min(dur - 0.001, offsetSec)) : (app.playOffset % dur);
 
+  // If user selected "A: Blurry MP3" in Cartridge A/B mode, play the genuine compressed MP3 audio!
+  if (app.abSource === "mp3" && app.blurryMp3Buffer) {
+    ensureAudio();
+    stopPlayback(false);
+    const src = app.audioCtx.createBufferSource();
+    src.buffer = app.blurryMp3Buffer;
+    src.loop = app.loop;
+    src.connect(app.gainNode);
+    src.onended = () => {
+      if (!app.loop) {
+        app.playing = false;
+        app.playEngine = "none";
+        app.playOffset = 0;
+        $("btn-play").textContent = "Play";
+      }
+    };
+    src.start(0, off % (app.blurryMp3Buffer.duration || 1));
+    app.sourceNode = src;
+    app.playStartCtxTime = app.audioCtx.currentTime;
+    app.playOffset = off;
+    app.playing = true;
+    app.playEngine = "webaudio";
+    $("btn-play").textContent = "Pause";
+    return;
+  }
+
   if (app.fasConnected) {
     stopPlayback(false);
     app.playOffset = off;
@@ -582,7 +633,7 @@ function buildActiveAudioPlanesForOffline() {
   return app.planes.map((pl) => new Float32Array(pl));
 }
 
-function synthesizeOfflineWav({ autoDownload = false, autoPlay = false } = {}) {
+function synthesizeOfflineWav({ autoDownload = false, autoPlay = false, onDone = null } = {}) {
   if (app.clips.length === 0) return;
   stopPlayback(false);
   recomputeTimelinePlanes();
@@ -640,6 +691,8 @@ function synthesizeOfflineWav({ autoDownload = false, autoPlay = false } = {}) {
       if (app.masterWavUrl) URL.revokeObjectURL(app.masterWavUrl);
       const wavBlob = new Blob([msg.masterWavBuf], { type: "audio/wav" });
       app.masterWavUrl = URL.createObjectURL(wavBlob);
+      app.lastAudioF32 = new Float32Array(msg.audioF32Buf);
+      app.lastAudioSr = msg.audioSr || 48000;
       app.masterSpecCanvas = rgbaToCanvas(new Uint8ClampedArray(msg.specRgbaBuf), msg.specW, msg.specH);
       try {
         ensureAudio();
@@ -653,10 +706,308 @@ function synthesizeOfflineWav({ autoDownload = false, autoPlay = false } = {}) {
       renderUI();
       if (autoPlay) startPlayback(0);
       if (autoDownload) $("btn-dl-wav").click();
+      if (onDone) onDone();
     }
   };
 
   worker.postMessage({ jobId, planes: sendPlanes, P: useP, C: app.planeC, cfg: offlineCfg }, transfers);
+}
+
+// --- Dual-Layer APIC MP3 Synth-Cartridge Export & Drop-to-Expand ---
+function buildCurrentCartridgeRecipe() {
+  return {
+    schema: CARTRIDGE_SCHEMA,
+    ...app.activeRecipe,
+    breathing: app.breathingEnabled,
+    synthSource: app.flipbook.synthSource,
+    trailDecay: app.flipbook.trailDecay,
+    chromaBlue: app.flipbook.chromaBlue,
+    fasMethod: app.fasCfg.method,
+    fasHeight: app.fasCfg.h,
+    slotDurationS: app.cfg.slotDurationS,
+    numClips: app.clips.length,
+  };
+}
+
+async function exportCartridgeMp3() {
+  if (app.clips.length === 0) return;
+  const finishPack = async () => {
+    try {
+      setBusy(true, "Encoding MP3 + Dual-Layer APIC Cover…");
+      await new Promise((r) => setTimeout(r, 15));
+      const bitrate = parseInt($("cart-bitrate").value, 10) || 96;
+      const recipe = buildCurrentCartridgeRecipe();
+
+      // Collect visual frame RGBA samples for the 512x512 neon mosaic album cover
+      const coverFrames = [];
+      const srcCanvases = app.flipbook.synthSource === "event"
+        ? app.hiResEventCanvases
+        : app.hiResRawCanvases;
+      const sampleCount = Math.min(9, srcCanvases.length);
+      for (let i = 0; i < sampleCount; i++) {
+        const idx = Math.floor((i / Math.max(1, sampleCount)) * srcCanvases.length);
+        const cv = srcCanvases[idx];
+        const d = cv.getContext("2d").getImageData(0, 0, cv.width, cv.height);
+        coverFrames.push({ rgba: d.data, width: cv.width, height: cv.height });
+      }
+
+      // Render 512x512 cover with Layer 2 JPEG-safe 8x8 strip + visual mosaic body
+      const cov = renderCartridgeCoverRGBA(recipe, coverFrames);
+      const covCanvas = rgbaToCanvas(cov.rgba, cov.width, cov.height);
+      app.apicCoverCanvas = covCanvas;
+
+      // Convert cover to PNG and inject Layer 1 JSON `tEXt` chunk
+      const pngBlob = await new Promise((resolve) => covCanvas.toBlob(resolve, "image/png"));
+      const rawPngU8 = new Uint8Array(await pngBlob.arrayBuffer());
+      const taggedPngU8 = injectPngTextChunk(rawPngU8, CARTRIDGE_TEXT_KEY, JSON.stringify(recipe));
+
+      // Encode mono MP3 using vendored lamejs
+      const rawMp3 = encodeAudioToMp3(app.lastAudioF32, app.lastAudioSr, bitrate);
+
+      // Attach ID3v2.3 APIC + CHAP markers
+      const slotMs = Math.round((Number(app.cfg.slotDurationS) || 0.25) * 1000);
+      const chapters = app.clips.map((c, i) => ({
+        startMs: i * slotMs,
+        endMs: (i + 1) * slotMs,
+        title: `${i + 1}_${c.polarity}_${c.title}`,
+      }));
+      const fullMp3 = attachId3v2ToMp3(rawMp3, {
+        coverPngBytes: taggedPngU8,
+        title: `Spectral Cartridge (${recipe.type})`,
+        album: "Spectral Timeline",
+        chapters,
+      });
+
+      // Also decode our own blurry MP3 into WebAudio so user can A/B compare immediately!
+      try {
+        ensureAudio();
+        app.blurryMp3Buffer = await app.audioCtx.decodeAudioData(fullMp3.buffer.slice(0));
+        app.cartridgeLayer = "Exported (L1 PNG + L2 8×8)";
+      } catch (_) {}
+
+      const blob = new Blob([fullMp3], { type: "audio/mpeg" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `spectral_cartridge_${recipe.type}_${bitrate}k.mp3`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
+
+      setBusy(false);
+      app.statusNote = `Exported Cartridge MP3 (${(fullMp3.length / 1024).toFixed(1)} KB @ ${bitrate}k · L1 PNG + L2 8×8 APIC)`;
+      $("deliver-note").textContent = `Ready to share! Drop this ${(fullMp3.length / 1024).toFixed(1)} KB .mp3 back onto this page anytime to re-expand.`;
+      renderUI();
+    } catch (err) {
+      setBusy(false);
+      app.statusNote = `Cartridge MP3 error: ${err?.message || err}`;
+      renderUI();
+    }
+  };
+
+  if (app.dirty || !app.lastAudioF32) {
+    synthesizeOfflineWav({ autoDownload: false, autoPlay: false, onDone: finishPack });
+  } else {
+    finishPack();
+  }
+}
+
+function expandCartridgeRecipe(recipe, layerLabel) {
+  app.flipbook.synthSource = recipe.synthSource || "event";
+  app.flipbook.trailDecay = Number(recipe.trailDecay ?? 0.45);
+  app.flipbook.chromaBlue = Boolean(recipe.chromaBlue ?? true);
+  app.breathingEnabled = Boolean(recipe.breathing ?? true);
+  if (recipe.fasMethod !== undefined) {
+    app.fasCfg.method = Number(recipe.fasMethod) || 0;
+    fas.setSynthMethod(app.fasCfg.method);
+  }
+
+  if (recipe.type === "shape_morph") {
+    runShowreelDemo("shape_morph", recipe, true);
+  } else if (recipe.type === "plasma_showreel") {
+    runShowreelDemo("plasma_showreel", recipe, true);
+  } else if (recipe.type === "secp256k1") {
+    runShowreelDemo("secp256k1", recipe, true);
+  } else if (recipe.type === "text_card") {
+    const res = renderUniformPixelBoxRGBA({
+      text: recipe.text || "RAMANUJAN CHIME 1729",
+      cols: recipe.cols || null,
+      bandMode: recipe.bandMode || "full",
+    });
+    app.clips = [];
+    const m = addMediaFromRGBA(`expanded_${res.rows}x${res.cols}.png`, res.rgba, res.width, res.height);
+    addClip(m.mediaId, "pos", null, true);
+    app.activeRecipe = { ...recipe };
+    app.cfg.slotDurationS = Number(recipe.slotDurationS) || 2.0;
+    markDirty(`Expanded Cartridge (${layerLabel})`);
+    synthesizeOfflineWav({ autoDownload: false, autoPlay: true });
+  } else {
+    app.statusNote = `Loaded MP3 Cartridge (${layerLabel}, custom raster — playing blurry MP3)`;
+    app.abSource = "mp3";
+    renderUI();
+    startPlayback(0);
+    return;
+  }
+
+  app.cartridgeLayer = layerLabel;
+  app.abSource = "expanded";
+  app.statusNote = `★ CARTRIDGE EXPANDED (${layerLabel}) — toggle A: Blurry MP3 vs B: Expanded!`;
+  renderUI();
+}
+
+async function loadCartridgeMp3(file) {
+  try {
+    setBusy(true, `Reading Cartridge ${file.name}…`);
+    const ab = await file.arrayBuffer();
+    const u8 = new Uint8Array(ab);
+
+    // 1. Decode the actual compressed blurry MP3 audio for live A/B comparison
+    try {
+      ensureAudio();
+      app.blurryMp3Buffer = await app.audioCtx.decodeAudioData(ab.slice(0));
+    } catch (_) {
+      app.blurryMp3Buffer = null;
+    }
+
+    // 2. Parse ID3v2 APIC cover art
+    const apic = parseApicFromMp3(u8);
+    if (!apic || !apic.bytes || apic.bytes.length < 32) {
+      setBusy(false);
+      app.statusNote = "MP3 has no embedded APIC Cartridge cover art.";
+      renderUI();
+      return;
+    }
+
+    // Decode APIC image (PNG or JPEG!) to canvas for display + Layer 2 pixel fallback
+    const imgBlob = new Blob([apic.bytes], { type: apic.mime || "image/png" });
+    const bmp = await createImageBitmap(imgBlob);
+    const covC = document.createElement("canvas");
+    covC.width = bmp.width; covC.height = bmp.height;
+    const covCtx = covC.getContext("2d");
+    covCtx.drawImage(bmp, 0, 0);
+    const covRgba = covCtx.getImageData(0, 0, covC.width, covC.height).data;
+    bmp.close();
+    app.apicCoverCanvas = covC;
+
+    // 3. Layer 1: Try lossless PNG tEXt chunk first
+    let recipe = null;
+    let layerLabel = "";
+    const texts = extractPngTextChunks(apic.bytes);
+    if (texts[CARTRIDGE_TEXT_KEY]) {
+      try {
+        const parsed = JSON.parse(texts[CARTRIDGE_TEXT_KEY]);
+        if (parsed && parsed.schema === CARTRIDGE_SCHEMA) {
+          recipe = parsed;
+          layerLabel = "Layer 1: Lossless PNG tEXt";
+        }
+      } catch (_) {}
+    }
+
+    // 4. Layer 2: Automatic JPEG-resilient 8x8 macro-block fallback!
+    if (!recipe) {
+      const l2 = decodeLayer2FromCoverRGBA(covRgba, covC.width, covC.height);
+      if (l2) {
+        recipe = l2;
+        layerLabel = "Layer 2: JPEG-Safe 8×8 Strip (CRC16 OK)";
+      }
+    }
+
+    setBusy(false);
+    if (!recipe) {
+      app.statusNote = "APIC cover found, but no Spectral Cartridge math header detected.";
+      app.monMode = "apic";
+      renderUI();
+      return;
+    }
+
+    expandCartridgeRecipe(recipe, layerLabel);
+  } catch (err) {
+    setBusy(false);
+    app.statusNote = `MP3 load error: ${err?.message || err}`;
+    renderUI();
+  }
+}
+
+// --- 1-Click Procedural Showreel Launcher ---
+function runShowreelDemo(kind, overrides = {}, autoPlay = true) {
+  stopPlayback(false);
+  if (kind === "shape_morph") {
+    const bpm = Number(overrides.bpm) || 120;
+    const beatsPerFrame = Number(overrides.beatsPerFrame) || 0.25;
+    const framesPerLeg = Number(overrides.framesPerLeg) || 6;
+    const style = overrides.style || "outline";
+    const breathing = overrides.breathing !== undefined ? Boolean(overrides.breathing) : true;
+
+    const seq = buildShapeMorphSequence({ bpm, beatsPerFrame, framesPerLeg, style, breathing });
+    app.cfg.slotDurationS = seq.slotDurationS;
+    app.flipbook.synthSource = overrides.synthSource || "hybrid";
+    app.flipbook.trailDecay = overrides.trailDecay !== undefined ? Number(overrides.trailDecay) : 0.45;
+    app.flipbook.hiResMode = false; // showcase the signature kinetic sonar look (user can flip Hi-Res anytime!)
+    app.clips = [];
+    app.breathingEnabled = false;
+    for (const fr of seq.frames) {
+      const m = addMediaFromRGBA(fr.filename, fr.grid.rgba, fr.grid.width, fr.grid.height);
+      addClip(m.mediaId, fr.polarity, null, true);
+    }
+    app.breathingEnabled = breathing;
+    app.activeRecipe = { type: "shape_morph", bpm, beatsPerFrame, framesPerLeg, style };
+    app.selectedClipIdx = 0;
+    app.selectedSeamIdx = 0;
+    app.monMode = "video";
+    app.videoMode = "event";
+    markDirty(`Showreel 1: Shape Morph (${seq.frames.length}f @ ${bpm} BPM)`);
+  } else if (kind === "plasma_showreel") {
+    const bpm = Number(overrides.bpm) || 120;
+    const beatsPerFrame = Number(overrides.beatsPerFrame) || 0.25;
+    const totalFrames = Number(overrides.totalFrames) || 24;
+    const breathing = overrides.breathing !== undefined ? Boolean(overrides.breathing) : true;
+
+    const seq = buildPlasmaShowreelSequence({ bpm, beatsPerFrame, totalFrames, breathing });
+    app.cfg.slotDurationS = seq.slotDurationS;
+    app.flipbook.synthSource = overrides.synthSource || "event";
+    app.flipbook.trailDecay = overrides.trailDecay !== undefined ? Number(overrides.trailDecay) : 0.45;
+    app.flipbook.chromaBlue = true;
+    app.flipbook.hiResMode = true;
+    app.clips = [];
+    app.breathingEnabled = false;
+    for (const fr of seq.frames) {
+      const m = addMediaFromRGBA(fr.filename, fr.grid.rgba, fr.grid.width, fr.grid.height);
+      addClip(m.mediaId, fr.polarity, null, true);
+    }
+    app.breathingEnabled = breathing;
+    app.activeRecipe = { type: "plasma_showreel", bpm, beatsPerFrame, totalFrames };
+    app.selectedClipIdx = 0;
+    app.selectedSeamIdx = 0;
+    app.monMode = "video";
+    app.videoMode = "event";
+    markDirty(`Showreel 2: Plasma Sphere + Aura + Cut (${seq.frames.length}f · ★Cut #${seq.cutFrame + 1})`);
+  } else if (kind === "secp256k1") {
+    const kRaw = String(overrides.kRaw || "1");
+    const count = Number(overrides.count) || 4;
+    const alignMode = overrides.alignMode || "66_header";
+    const bandMode = overrides.bandMode || "full";
+
+    const { cards } = buildSecp256k1BreathingCards({ kRaw, count, alignMode, bandMode });
+    app.cfg.slotDurationS = Number(overrides.slotDurationS) || 1.0;
+    app.flipbook.synthSource = overrides.synthSource || "full";
+    app.flipbook.hiResMode = true;
+    app.clips = [];
+    app.breathingEnabled = false;
+    for (const card of cards) {
+      const m = addMediaFromRGBA(card.filename, card.grid.rgba, card.grid.width, card.grid.height);
+      addClip(m.mediaId, card.polarity, null, true);
+    }
+    app.breathingEnabled = true;
+    app.activeRecipe = { type: "secp256k1", kRaw, count, alignMode, bandMode };
+    app.selectedClipIdx = 0;
+    app.selectedSeamIdx = 0;
+    app.monMode = "timeline";
+    markDirty(`Showreel 3: secp256k1 K / K·G Breathing (${count} pairs · 3×22 pixel-boxes)`);
+  }
+
+  if (autoPlay) {
+    if (app.fasConnected) startPlayback(0);
+    else synthesizeOfflineWav({ autoDownload: false, autoPlay: true });
+  }
 }
 
 // --- Exports ---
@@ -750,14 +1101,20 @@ function drawLoop() {
   }
 
   let srcCanvas = null;
-  if (app.monMode === "timeline") srcCanvas = app.stitchedCanvas;
+  if (app.monMode === "apic") srcCanvas = app.apicCoverCanvas;
+  else if (app.monMode === "timeline") srcCanvas = app.stitchedCanvas;
   else if (app.monMode === "master") srcCanvas = app.masterSpecCanvas;
   else if (app.monMode === "seam") srcCanvas = getSeamCanvasLazy(app.selectedSeamIdx);
   else srcCanvas = app.clipCanvases[app.selectedClipIdx] || null;
 
   if (srcCanvas) {
-    ctx.imageSmoothingEnabled = true;
-    ctx.drawImage(srcCanvas, 0, 0, w, h);
+    ctx.imageSmoothingEnabled = app.monMode !== "apic";
+    if (app.monMode === "apic") {
+      const side = Math.min(w, h) - 16 * dpr;
+      ctx.drawImage(srcCanvas, Math.floor((w - side) / 2), Math.floor((h - side) / 2), side, side);
+    } else {
+      ctx.drawImage(srcCanvas, 0, 0, w, h);
+    }
   } else {
     ctx.fillStyle = "#5c677a";
     ctx.font = `${13 * dpr}px ui-monospace, monospace`;
@@ -843,7 +1200,14 @@ function renderUI() {
   vresBtn.textContent = app.flipbook.hiResMode ? "Hi-Res 16:9" : "Sonar Grid";
   vresBtn.classList.toggle("active", app.flipbook.hiResMode);
 
-  if (app.monMode === "timeline") {
+  $("mon-tab-apic").classList.toggle("hidden", !app.apicCoverCanvas);
+  $("ab-mp3-wrap").classList.toggle("hidden", !app.blurryMp3Buffer);
+  $("btn-ab-expanded").classList.toggle("active", app.abSource === "expanded");
+  $("btn-ab-mp3").classList.toggle("active", app.abSource === "mp3");
+
+  if (app.monMode === "apic") {
+    $("mon-info").textContent = `Dual-Layer APIC Cover (512×512 · Top 32px = JPEG-Safe 8×8 Expansion Math Strip) · ${app.cartridgeLayer}`;
+  } else if (app.monMode === "timeline") {
     $("mon-info").textContent = `Stitched ${srcLbl} Stream (${app.clips.length} clips · ${totalDurationS().toFixed(2)}s) · Click canvas to scrub`;
   } else if (app.monMode === "video") {
     const fps = (1 / Math.max(0.02, Number(app.cfg.slotDurationS) || 0.125)).toFixed(1);
@@ -1186,6 +1550,33 @@ function syncFasConfigFromUI() {
 }
 
 function bindEvents() {
+  // 1-Click Showreel Selector
+  $("showreel-select").addEventListener("change", () => {
+    const val = $("showreel-select").value;
+    if (val) {
+      runShowreelDemo(val, {}, true);
+      $("showreel-select").value = "";
+    }
+  });
+
+  // Cartridge MP3 Export / Load & A/B Switcher
+  $("btn-export-cartridge").addEventListener("click", exportCartridgeMp3);
+  $("btn-load-cartridge").addEventListener("click", () => $("file-cartridge").click());
+  $("file-cartridge").addEventListener("change", (ev) => {
+    if (ev.target.files.length) loadCartridgeMp3(ev.target.files[0]);
+    ev.target.value = "";
+  });
+  $("btn-ab-expanded").addEventListener("click", () => {
+    app.abSource = "expanded";
+    renderUI();
+    if (app.playing) startPlayback(currentPlayheadSec());
+  });
+  $("btn-ab-mp3").addEventListener("click", () => {
+    app.abSource = "mp3";
+    renderUI();
+    if (app.playing) startPlayback(currentPlayheadSec());
+  });
+
   $("fas-addr").addEventListener("change", () => {
     app.fasCfg.address = $("fas-addr").value.trim() || "127.0.0.1:3003";
     localStorage.setItem("st-fas-addr", app.fasCfg.address);
@@ -1248,8 +1639,25 @@ function bindEvents() {
 
   $("btn-import-media").addEventListener("click", () => $("file-media").click());
   $("file-media").addEventListener("change", (ev) => {
-    if (ev.target.files.length) importFiles(ev.target.files);
+    const files = Array.from(ev.target.files || []);
+    const mp3 = files.find((f) => /\.mp3$/i.test(f.name) || f.type === "audio/mpeg");
+    if (mp3) loadCartridgeMp3(mp3);
+    else if (files.length) importFiles(files);
     ev.target.value = "";
+  });
+
+  // Allow dropping a Cartridge .mp3 anywhere onto the window
+  window.addEventListener("dragover", (ev) => {
+    if (!app.dragPayload) ev.preventDefault();
+  });
+  window.addEventListener("drop", (ev) => {
+    if (app.dragPayload) return;
+    const files = Array.from(ev.dataTransfer?.files || []);
+    const mp3 = files.find((f) => /\.mp3$/i.test(f.name) || f.type === "audio/mpeg");
+    if (mp3) {
+      ev.preventDefault();
+      loadCartridgeMp3(mp3);
+    }
   });
 
   const bay = $("media-bay");
@@ -1259,11 +1667,18 @@ function bindEvents() {
     if (app.dragPayload) return;
     ev.preventDefault();
     bay.classList.remove("drag-over");
-    if (ev.dataTransfer.files.length >= 6) {
-      // Dropping 6+ files at once automatically loads as an ordered Flipbook Sequence!
-      importFlipbookSequence(ev.dataTransfer.files);
-    } else if (ev.dataTransfer.files.length) {
-      importFiles(ev.dataTransfer.files);
+    const files = Array.from(ev.dataTransfer.files || []);
+    const mp3File = files.find((f) => /\.mp3$/i.test(f.name) || f.type === "audio/mpeg");
+    if (mp3File) {
+      loadCartridgeMp3(mp3File);
+      return;
+    }
+    if (files.length >= 6) {
+      app.activeRecipe = { type: "custom_raster" };
+      importFlipbookSequence(files);
+    } else if (files.length) {
+      app.activeRecipe = { type: "custom_raster" };
+      importFiles(files);
     }
   });
 
@@ -1321,6 +1736,7 @@ function bindEvents() {
       addClip(m.mediaId, fr.polarity, null, true);
     }
     app.breathingEnabled = breathing;
+    app.activeRecipe = { type: "shape_morph", bpm, beatsPerFrame, framesPerLeg, style };
     app.selectedClipIdx = 0;
     app.selectedSeamIdx = 0;
     app.monMode = andPlay ? "video" : "timeline";
@@ -1349,6 +1765,13 @@ function bindEvents() {
         addClip(m.mediaId, card.polarity, null, true);
       }
       app.breathingEnabled = true;
+      app.activeRecipe = {
+        type: "secp256k1",
+        kRaw: $("secp-k").value,
+        count: parseInt($("secp-count").value, 10) || 1,
+        alignMode: $("secp-align").value,
+        bandMode: $("secp-band").value,
+      };
       app.selectedSeamIdx = 0;
       app.monMode = "timeline";
       markDirty(`Generated ${cards.length / 2} secp256k1 K / K·G breathing pair(s)`);

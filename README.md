@@ -6,6 +6,16 @@ A **Resolve-style image-to-spectrogram timeline frontend** built for **GitHub Pa
 
 ---
 
+## Showreel & Synth-Cartridge `.mp3` Sharing
+
+* **1-Click `★ Showreel Demos` (Top Bar):**
+  1. **Shape Morph (`120 BPM · 24f`):** `Tri → Cir → Tri → Sq` breathing morph at 8 fps with Event-Cam & phosphor trails.
+  2. **Plasma Sphere + Aura + Cut (`24f`):** 100% original procedural expanding cyan energy sphere + flickering golden aura + beat-16 hard cut (demonstrates stereo Event-Cam `+ON / −OFF`, `Chroma → FAS Blue` timbre split, and automatic `★CUT` detection).
+  3. **`secp256k1` `K / K·G` Breathing:** Uniform `3×22` pixel-box scalar-multiplication chain.
+* **Dual-Layer `APIC` MP3 Cartridge (`Export / Strip / WAV` Tab):**
+  * Click **`Export Cartridge (.mp3)`** to encode a tiny shareable MP3 (`64–128 kbps`, pure-JS via vendored `lamejs`) whose `512×512` `APIC` cover art embeds the exact lossless expansion math in **Layer 1 (PNG `tEXt`)** and **Layer 2 (JPEG-resilient `8×8` macro-block strip with CRC16)**.
+  * Drop any Cartridge `.mp3` back onto the page to re-expand it into crisp 512-oscillator video + audio and toggle **`A: Blurry MP3`** vs. **`B: Expanded`** live!
+
 ## Quick Start with Fragment Audio Server (`fas.exe`)
 
 1. Download **`fas-2.0.2-x86_64-win.zip`** from https://github.com/grz0zrg/fas/releases/tag/v2.0.2 and extract into `fas_bin/` (or run `start_fas.bat` in your local clone).

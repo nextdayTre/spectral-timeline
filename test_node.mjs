@@ -2,6 +2,8 @@
 // Zero-dependency Node verification suite for Spectral Timeline (GitHub Pages engine)
 
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import vm from "node:vm";
 import {
   FAS_VOID,
   buildActionPacket,
@@ -14,12 +16,25 @@ import {
 } from "./js/fas_client.js";
 import {
   SECP256K1_P,
+  buildPlasmaShowreelSequence,
   buildSecp256k1BreathingCards,
   buildShapeMorphSequence,
   renderUniformPixelBoxRGBA,
   secp256k1PairHex,
   secp256k1ScalarMul,
 } from "./js/glyph_grid.js";
+import {
+  CARTRIDGE_SCHEMA,
+  CARTRIDGE_TEXT_KEY,
+  attachId3v2ToMp3,
+  decodeLayer2FromCoverRGBA,
+  encodeAudioToMp3,
+  encodeUncompressedPng,
+  extractPngTextChunks,
+  injectPngTextChunk,
+  parseApicFromMp3,
+  renderCartridgeCoverRGBA,
+} from "./js/mp3_cartridge.js";
 import {
   buildFreqGrid,
   computeEventCameraSequence,
@@ -257,6 +272,105 @@ import {
   const wCyan = rgbaToChromaWarmthPlane(cyanRgba, 4, 4, 4, 4)[0];
   assert.ok(wGold > 0.8 && wCyan < 0.25, `Expected gold (${wGold}) >> cyan (${wCyan})`);
   console.log(`[PASS] Event-Cam (+ON/-OFF + phosphor trail + scene cut) & Chroma warmth (gold=${wGold.toFixed(2)} vs cyan=${wCyan.toFixed(2)})`);
+}
+
+// 8. Procedural Plasma Sphere + Golden Aura + Hard Cut Showreel
+{
+  const show = buildPlasmaShowreelSequence({ bpm: 120, beatsPerFrame: 0.25, totalFrames: 24, breathing: true });
+  assert.equal(show.frames.length, 24);
+  assert.equal(show.cutFrame, 16);
+  const cfg = { ...defaultConfig(), partials: 48, pps: 192, slotDurationS: 0.25, featherMs: 0 };
+  const demods = show.frames.map((fr) =>
+    rgbaToConditionedPlane(fr.grid.rgba, fr.grid.width, fr.grid.height, cfg, "pos", "raw", true).plane
+  );
+  const ev = computeEventCameraSequence(demods, 48, 48, { threshold: 0.04, gain: 1.8, decay: 0.45 });
+  // Strongest scene-cut delta should land right on cutFrame (16)!
+  let bestIdx = 1, bestVal = 0;
+  for (let i = 1; i < ev.frameMotionScores.length; i++) {
+    if (ev.frameMotionScores[i] > bestVal) { bestVal = ev.frameMotionScores[i]; bestIdx = i; }
+  }
+  assert.equal(bestIdx, show.cutFrame, `Expected peak cut at frame ${show.cutFrame}, got ${bestIdx}`);
+  console.log(`[PASS] Procedural Plasma Showreel (24f @ 120 BPM, peak cut locked at #${bestIdx + 1}, Δ=${bestVal.toFixed(3)})`);
+}
+
+// 9. Full End-to-End MP3 Synth-Cartridge Round-Trip (lamejs + ID3v2 APIC + Layer 1 PNG tEXt + Layer 2 8x8 Stress!)
+{
+  const lameCtx = {};
+  vm.runInNewContext(fs.readFileSync("./js/vendor/lame.min.js", "utf8"), lameCtx);
+
+  const recipe = {
+    schema: CARTRIDGE_SCHEMA,
+    type: "shape_morph",
+    bpm: 120,
+    beatsPerFrame: 0.25,
+    framesPerLeg: 6,
+    style: "outline",
+    breathing: true,
+    synthSource: "hybrid",
+    trailDecay: 0.45,
+    chromaBlue: true,
+    fasMethod: 1,
+    fasHeight: 512,
+    slotDurationS: 0.125,
+    numClips: 24,
+  };
+
+  // Encode 0.5s test audio to real 96 kbps MP3
+  const pcm = new Float32Array(24000);
+  for (let i = 0; i < pcm.length; i++) pcm[i] = 0.5 * Math.sin((2 * Math.PI * 440 * i) / 48000);
+  const rawMp3 = encodeAudioToMp3(pcm, 48000, 96, lameCtx.lamejs);
+  assert.ok(rawMp3.length > 2000 && rawMp3[0] === 0xFF);
+
+  // Build 512x512 dual-layer cover PNG + Layer 1 tEXt + ID3v2.3 APIC + CHAP
+  const cov = renderCartridgeCoverRGBA(recipe, []);
+  const rawPng = encodeUncompressedPng(cov.rgba, cov.width, cov.height);
+  const taggedPng = injectPngTextChunk(rawPng, CARTRIDGE_TEXT_KEY, JSON.stringify(recipe));
+  const cartMp3 = attachId3v2ToMp3(rawMp3, {
+    coverPngBytes: taggedPng,
+    title: "Shape Morph Cartridge",
+    chapters: [{ startMs: 0, endMs: 125, title: "01_Tri" }],
+  });
+  assert.equal(String.fromCharCode(cartMp3[0], cartMp3[1], cartMp3[2]), "ID3");
+
+  // Parse APIC back out of .mp3
+  const apic = parseApicFromMp3(cartMp3);
+  assert.ok(apic && apic.mime === "image/png");
+
+  // Layer 1 check: bit-exact JSON round-trip
+  const texts = extractPngTextChunks(apic.bytes);
+  const dec1 = JSON.parse(texts[CARTRIDGE_TEXT_KEY]);
+  assert.equal(dec1.type, "shape_morph");
+  assert.equal(dec1.bpm, 120);
+  assert.equal(dec1.framesPerLeg, 6);
+  assert.equal(dec1.synthSource, "hybrid");
+
+  // Layer 2 check: simulate JPEG-like compression noise (+-28 luma noise + resize to 500x500)
+  const stressedW = 500, stressedH = 500;
+  const stressed = new Uint8ClampedArray(stressedW * stressedH * 4);
+  for (let y = 0; y < stressedH; y++) {
+    const sy = Math.floor((y / stressedH) * cov.height);
+    for (let x = 0; x < stressedW; x++) {
+      const sx = Math.floor((x / stressedW) * cov.width);
+      const so = (sy * cov.width + sx) * 4;
+      const doff = (y * stressedW + x) * 4;
+      const noise = ((x * 37 + y * 17) % 57) - 28;
+      stressed[doff] = Math.max(0, Math.min(255, cov.rgba[so] + noise));
+      stressed[doff + 1] = Math.max(0, Math.min(255, cov.rgba[so + 1] + noise));
+      stressed[doff + 2] = Math.max(0, Math.min(255, cov.rgba[so + 2] + noise));
+      stressed[doff + 3] = 255;
+    }
+  }
+  const dec2 = decodeLayer2FromCoverRGBA(stressed, stressedW, stressedH);
+  assert.ok(dec2 !== null, "Layer 2 CRC16 decode must survive 500x500 noisy stress!");
+  assert.equal(dec2.type, "shape_morph");
+  assert.equal(dec2.bpm, 120);
+  assert.equal(dec2.beatsPerFrame, 0.25);
+  assert.equal(dec2.framesPerLeg, 6);
+  assert.equal(dec2.synthSource, "hybrid");
+  assert.equal(dec2.trailDecay, 0.45);
+  assert.equal(dec2.fasMethod, 1);
+  assert.equal(dec2.fasHeight, 512);
+  console.log(`[PASS] MP3 Synth-Cartridge round-trip (${(rawMp3.length / 1024).toFixed(1)} KB MP3 · Layer 1 PNG tEXt OK · Layer 2 500x500 noisy stress CRC16 OK)`);
 }
 
 console.log("\nALL SPECTRAL TIMELINE BROWSER-ENGINE SELF-TESTS PASSED.");

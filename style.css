@@ -65,6 +65,19 @@ html, body {
   color: var(--green);
 }
 
+.showreel-select {
+  background: #14221b;
+  color: var(--green);
+  border: 1px solid rgba(56, 212, 122, 0.55);
+  border-radius: 5px;
+  padding: 3px 8px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.showreel-select:hover { border-color: var(--green); }
+.ab-wrap { display: inline-flex; align-items: center; gap: 4px; }
+.ctrl-row select#cart-bitrate { width: 145px; }
+
 .fas-box {
   display: inline-flex;
   align-items: center;

@@ -24,6 +24,7 @@ self.onmessage = (ev) => {
     const nClips = Math.max(1, planes.length);
     const frameW = Math.max(64, Math.min(180, Math.floor(1920 / nClips)));
     const spec = renderStftSpectrogramRGBA(audio, cfg, frameW * nClips, 320, -78.0);
+    const audioF32 = new Float32Array(audio);
     const elapsedMs = performance.now() - t0;
 
     self.postMessage(
@@ -34,13 +35,15 @@ self.onmessage = (ev) => {
         slotRmsDb,
         masterWavBuf: masterWav.buffer,
         playWavBuf: playWav.buffer,
+        audioF32Buf: audioF32.buffer,
+        audioSr: cfg.sr,
         specRgbaBuf: spec.rgba.buffer,
         specW: spec.width,
         specH: spec.height,
         frameW,
         numClips: nClips,
       },
-      [masterWav.buffer, playWav.buffer, spec.rgba.buffer]
+      [masterWav.buffer, playWav.buffer, audioF32.buffer, spec.rgba.buffer]
     );
   } catch (err) {
     self.postMessage({ type: "error", jobId, message: err?.message || String(err) });

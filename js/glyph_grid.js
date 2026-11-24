@@ -471,3 +471,138 @@ export function buildShapeMorphSequence({
   };
 }
 
+// ---------------------------------------------------------------------------
+// 100% Original Procedural Showreel: "Plasma Sphere + Golden Aura + Impact Cut"
+// Reproduces the exact Event-Cam + Chromatic Blue + Scene-Cut physics with 0 KB assets!
+// ---------------------------------------------------------------------------
+export function buildPlasmaShowreelSequence({
+  bpm = 120,
+  beatsPerFrame = 0.25,
+  totalFrames = 24,
+  breathing = true,
+  width = 320,
+  height = 180,
+} = {}) {
+  const bpmClamped = Math.max(60, Math.min(200, Number(bpm) || 120));
+  const bpf = Math.max(0.25, Math.min(2.0, Number(beatsPerFrame) || 0.25));
+  const nFrames = Math.max(12, Math.min(48, Math.round(Number(totalFrames) || 24)));
+  const cutFrame = Math.floor(nFrames * 0.67); // e.g., frame 16 of 24 -> crisp beat-aligned scene cut!
+  const slotDurationS = Number(((60.0 / bpmClamped) * bpf).toFixed(4));
+
+  const frames = [];
+  for (let f = 0; f < nFrames; f++) {
+    const rgba = new Uint8ClampedArray(width * height * 4);
+    for (let i = 3; i < rgba.length; i += 4) rgba[i] = 255;
+
+    const isCutPhase = f >= cutFrame;
+    const u = isCutPhase ? (f - cutFrame) / Math.max(1, nFrames - cutFrame) : f / Math.max(1, cutFrame);
+
+    if (!isCutPhase) {
+      // Act 1: Expanding Cyan Plasma Sphere (bottom-left) + Flickering Golden Aura (top-right)
+      const scx = width * 0.16;
+      const scy = height * 0.88;
+      const sphereR = height * (0.48 + 0.56 * u);
+
+      const acx = width * (0.74 - 0.04 * u);
+      const acy = height * (0.28 + 0.04 * Math.sin(f * 1.1));
+      const auraBaseR = height * (0.14 + 0.03 * Math.sin(f * 2.3));
+
+      for (let y = 0; y < height; y++) {
+        const rowOff = y * width;
+        const skyShade = 0.10 + 0.14 * (y / height);
+        for (let x = 0; x < width; x++) {
+          let r = 8, g = Math.round(skyShade * 70), b = Math.round(skyShade * 185);
+
+          // Expanding Cyan Energy Sphere with pulsing concentric shock rings
+          const ds = Math.hypot(x - scx, y - scy);
+          if (ds < sphereR + 14) {
+            const rim = Math.exp(-Math.pow((ds - sphereR) / 5.5, 2));
+            const inner = ds < sphereR ? (0.52 + 0.35 * (ds / sphereR)) : 0;
+            const ring = ds < sphereR ? 0.16 * Math.pow(0.5 + 0.5 * Math.sin(ds * 0.19 - f * 0.7), 3) : 0;
+            const glow = Math.min(1.0, inner + rim * 0.95 + ring);
+            r = Math.min(255, Math.round(r + glow * 115));
+            g = Math.min(255, Math.round(g + glow * 238));
+            b = Math.min(255, Math.round(b + glow * 255));
+          }
+
+          // Spiky Flickering Golden Plasma Aura (upper-right -> high Hz + warm Chroma Blue!)
+          const ax = x - acx, ay = y - acy;
+          const da = Math.hypot(ax, ay);
+          if (da < auraBaseR * 2.2) {
+            const ang = Math.atan2(ay, ax);
+            const spikes =
+              1.0 +
+              0.32 * Math.sin(ang * 11 + f * 2.1) +
+              0.22 * Math.cos(ang * 17 - f * 3.4);
+            const rEdge = auraBaseR * spikes;
+            if (da < rEdge) {
+              const core = da < auraBaseR * 0.32 ? 0.25 : 1.0; // dark core silhouette inside aura!
+              const edgeFade = Math.min(1.0, (rEdge - da) / 8.0);
+              const inten = edgeFade * core;
+              r = Math.min(255, Math.round(r * (1 - inten) + 255 * inten));
+              g = Math.min(255, Math.round(g * (1 - inten) + 225 * inten));
+              b = Math.min(255, Math.round(b * (1 - inten) + 35 * inten));
+            }
+          }
+
+          const o = (rowOff + x) * 4;
+          rgba[o] = r; rgba[o + 1] = g; rgba[o + 2] = b;
+        }
+      }
+    } else {
+      // Act 2 (Hard Scene Cut!): Crimson/Pink Horizon Shockwave + Bracing Silhouette on Rocky Peaks
+      const pulse = 0.5 + 0.5 * Math.sin((f - cutFrame) * 1.4);
+      for (let y = 0; y < height; y++) {
+        const rowOff = y * width;
+        const ny = y / height;
+        for (let x = 0; x < width; x++) {
+          const nx = x / width;
+          // Jagged rocky horizon silhouette
+          const hillY = 0.62 - 0.16 * Math.pow(Math.sin(nx * 5.2 + 0.4), 2) - 0.08 * Math.cos(nx * 13.0);
+          let r = 14, g = 16, b = 32;
+          if (ny > hillY) {
+            r = 55; g = 115; b = 75;
+          } else {
+            // Shockwave horizon glow expanding upward
+            const wave = Math.exp(-Math.pow((ny - (0.55 - 0.35 * u)) / 0.12, 2));
+            r = Math.min(255, Math.round(r + wave * 240));
+            g = Math.min(255, Math.round(g + wave * 95));
+            b = Math.min(255, Math.round(b + wave * 175));
+          }
+
+          // Center-left kinetic pink/white bracing figure pulsing with impact
+          const fx = (nx - 0.32) / 0.11;
+          const fy = (ny - (0.54 - 0.04 * pulse)) / 0.24;
+          const figDist = Math.hypot(fx, fy);
+          if (figDist < 1.0) {
+            const rim = figDist > 0.72 ? 1.0 : 0.85;
+            r = Math.round(255 * rim);
+            g = Math.round((130 + 60 * pulse) * rim);
+            b = Math.round(175 * rim);
+          }
+
+          const o = (rowOff + x) * 4;
+          rgba[o] = r; rgba[o + 1] = g; rgba[o + 2] = b;
+        }
+      }
+    }
+
+    const polarity = breathing ? (f % 2 === 0 ? "pos" : "neg") : "pos";
+    const tag = isCutPhase ? "Cut_Impact" : "Plasma_Aura";
+    frames.push({
+      index: f,
+      filename: `${String(f + 1).padStart(2, "0")}_${tag}.png`,
+      polarity,
+      grid: { rgba, width, height },
+    });
+  }
+
+  return {
+    bpm: bpmClamped,
+    beatsPerFrame: bpf,
+    slotDurationS,
+    cutFrame,
+    frames,
+  };
+}
+

@@ -12,6 +12,12 @@
     <header class="topbar">
       <div class="tb-left">
         <span class="brand">SPECTRAL TIMELINE</span>
+        <select id="showreel-select" class="showreel-select mono" title="Load a 1-click procedural Showreel demo">
+          <option value="">★ Showreel Demos ▾</option>
+          <option value="shape_morph">1 · Shape Morph (120 BPM · 24f)</option>
+          <option value="plasma_showreel">2 · Plasma Sphere + Aura + Cut (24f)</option>
+          <option value="secp256k1">3 · secp256k1 K / K·G Breathing</option>
+        </select>
         <span class="fas-box">
           <span id="fas-led" class="led led-off" title="Fragment Audio Server status"></span>
           <input id="fas-addr" type="text" class="mono fas-addr-input" value="127.0.0.1:3003" title="Fragment Audio Server WebSocket address" />
@@ -42,7 +48,7 @@
           <button id="btn-import-media" class="mini-btn">+ Import Images</button>
         </div>
         <div class="drop-hint">
-          Drop .png/.jpg here · Drag cards onto Timeline (Shift = − NEG)
+          Drop .png/.jpg or Cartridge .mp3 · Drag onto Timeline (Shift = − NEG)
         </div>
         <div id="media-grid" class="media-grid"></div>
       </aside>
@@ -55,6 +61,7 @@
             <button class="mon-tab" data-mon="seam">Seam Delta (4-State)</button>
             <button class="mon-tab" data-mon="video">Video-as-Audio</button>
             <button class="mon-tab" data-mon="master">Offline WAV STFT</button>
+            <button class="mon-tab hidden" id="mon-tab-apic" data-mon="apic">Cartridge Cover (APIC)</button>
           </div>
           <div class="mon-info mono muted" id="mon-info">Select a clip or click Synthesize WAV</div>
         </div>
@@ -83,6 +90,11 @@
           <button id="btn-rewind" class="mini-btn" title="Rewind">|&lt;</button>
           <button id="btn-play" class="mini-btn btn-primary" title="Play / Pause via FAS (or Offline WAV fallback) [Space]">Play</button>
           <button id="btn-loop" class="mini-btn active" title="Loop">Loop</button>
+          <span id="ab-mp3-wrap" class="ab-wrap hidden">
+            <span class="sep">|</span>
+            <button id="btn-ab-expanded" class="mini-btn active" title="Hear & view full Cover-Expanded Lossless synthesis">B: Expanded</button>
+            <button id="btn-ab-mp3" class="mini-btn" title="Hear the raw compressed blurry MP3 audio from the cartridge">A: Blurry MP3</button>
+          </span>
           <span class="sep">|</span>
           <span id="engine-badge" class="mono muted">Engine: FAS Offline (click Connect FAS or Offline WAV)</span>
           <span class="spacer"></span>
@@ -318,19 +330,37 @@
       </div>
 
       <div id="dock-deliver" class="dock-panel">
-        <div class="deliver-row">
-          <button id="btn-export-strip" class="btn btn-primary">Export Stitched Breathing Strip (.png)</button>
-          <button id="btn-export-wav2" class="btn">Offline Browser WAV (48k/24b)</button>
-          <button id="btn-export-json" class="btn">Download Seam Delta JSON</button>
-          <span class="mono muted" id="deliver-note">Tip: Use <code>fas.exe --render out</code> for native C11 FAS WAV recording, or drop the stitched PNG into Harmor / fsynth.</span>
+        <div class="cards-split">
+          <div class="card-gen-box">
+            <div class="gen-title">Synth-Cartridge .mp3 File Sharing (Blurry MP3 Audio + Cover-Art Dual-Layer Expansion Math)</div>
+            <div class="ctrl-row">
+              <label>MP3 Bitrate
+                <select id="cart-bitrate">
+                  <option value="64">64 kbps (Ultra-Small)</option>
+                  <option value="96" selected>96 kbps (Balanced)</option>
+                  <option value="128">128 kbps (Crisp)</option>
+                </select>
+              </label>
+              <button id="btn-export-cartridge" class="btn btn-primary">Export Cartridge (.mp3)</button>
+              <button id="btn-load-cartridge" class="btn">+ Load &amp; Expand Cartridge (.mp3)</button>
+              <button id="btn-export-strip" class="btn">Export Stitched Strip (.png)</button>
+              <button id="btn-export-wav2" class="btn">Offline WAV (48k/24b)</button>
+              <button id="btn-export-json" class="btn">Delta JSON</button>
+            </div>
+            <div class="fas-help mono muted" id="deliver-note">
+              Cartridge MP3 packs the playable audio + a 512×512 APIC cover carrying expansion math in Layer 1 (PNG tEXt) &amp; Layer 2 (JPEG-safe 8×8 strip). Drop any Cartridge .mp3 onto the page to expand!
+            </div>
+          </div>
         </div>
       </div>
     </footer>
 
-    <input id="file-media" type="file" accept="image/png,image/jpeg,image/webp" multiple class="hidden" />
+    <input id="file-media" type="file" accept="image/png,image/jpeg,image/webp,audio/mpeg,.mp3" multiple class="hidden" />
     <input id="file-seq" type="file" accept="image/png,image/jpeg,image/webp" multiple class="hidden" />
+    <input id="file-cartridge" type="file" accept="audio/mpeg,.mp3" class="hidden" />
   </div>
 
+  <script src="./js/vendor/lame.min.js"></script>
   <script type="module" src="./js/app.js"></script>
 </body>
 </html>
