@@ -49,6 +49,7 @@
             <button class="mon-tab active" data-mon="clip">Clip Preview</button>
             <button class="mon-tab" data-mon="master">Master Spectrogram</button>
             <button class="mon-tab" data-mon="seam">Seam Delta (4-State)</button>
+            <button class="mon-tab" data-mon="video">Video-as-Audio (STFT)</button>
           </div>
           <div class="mon-info mono muted" id="mon-info">Select a clip or click Synthesize WAV</div>
         </div>
@@ -60,6 +61,12 @@
             <span class="leg-item"><i class="sw sw-01"></i>0→1 Ignite</span>
             <span class="leg-item"><i class="sw sw-10"></i>1→0 Quench</span>
             <span class="leg-item"><i class="sw sw-00"></i>0→0 Off</span>
+          </div>
+          <div id="video-bar" class="video-bar hidden mono">
+            <button class="vmode-btn active" data-vmode="demod" title="Un-flip negative polarity frames live from the WAV STFT">Demod (Unflip −)</button>
+            <button class="vmode-btn" data-vmode="raw" title="Watch raw alternating green↔black breathing polarity from the WAV STFT">Raw Breathing</button>
+            <button class="vmode-btn" data-vmode="event" title="Neuromorphic Event-Camera diff (+ON cyan / −OFF amber) between consecutive WAV STFT frames">Event Cam (Δ)</button>
+            <span id="video-frame-badge" class="vframe-badge">Frame 1 / 1</span>
           </div>
           <div id="busy-badge" class="busy-badge hidden mono">Synthesizing…</div>
         </div>
@@ -97,6 +104,7 @@
     <footer class="dock">
       <div class="dock-tabs">
         <button class="dock-tab active" data-dock="synth">Synth &amp; Breathing</button>
+        <button class="dock-tab" data-dock="anim">Shape Morph (BPM)</button>
         <button class="dock-tab" data-dock="cards">Hex / K·G Cards</button>
         <button class="dock-tab" data-dock="deltas">Endomorphic Deltas</button>
         <button class="dock-tab" data-dock="deliver">Export / Manifest</button>
@@ -108,7 +116,7 @@
             <select id="cfg-preset"></select>
           </label>
           <label>Slot ΔT (s)
-            <input id="cfg-slot-s" type="number" min="0.5" max="10" step="0.5" />
+            <input id="cfg-slot-s" type="number" min="0.125" max="10" step="0.05" />
           </label>
           <label>Min Hz
             <input id="cfg-fmin" type="number" step="10" />
@@ -150,6 +158,45 @@
             Preserve Breathing Contrast
           </label>
           <button id="btn-apply-cfg" class="mini-btn">Apply</button>
+        </div>
+      </div>
+
+      <div id="dock-anim" class="dock-panel">
+        <div class="card-gen-box">
+          <div class="gen-title">BPM-Synced Video-as-Audio Litmus Test: Triangle → Circle → Triangle → Square (Loop)</div>
+          <div class="ctrl-row">
+            <label>Tempo (BPM)
+              <input id="anim-bpm" type="number" min="40" max="240" step="1" value="120" />
+            </label>
+            <label>Beats / Frame
+              <select id="anim-bpf">
+                <option value="0.25">1/4 beat (8 fps @ 120)</option>
+                <option value="0.5" selected>1/2 beat (4 fps @ 120)</option>
+                <option value="1">1 beat (2 fps @ 120)</option>
+                <option value="2">2 beats (1 fps @ 120)</option>
+              </select>
+            </label>
+            <label>Frames / Morph Leg
+              <select id="anim-fpl">
+                <option value="2">2 (8 frames)</option>
+                <option value="3" selected>3 (12 frames)</option>
+                <option value="4">4 (16 frames)</option>
+                <option value="6">6 (24 frames)</option>
+              </select>
+            </label>
+            <label>Render Style
+              <select id="anim-style">
+                <option value="outline" selected>Sonar Outline (Event-Cam Crisp)</option>
+                <option value="solid">Solid Silhouette (Max RMS Breath)</option>
+              </select>
+            </label>
+            <label class="chk-label">
+              <input id="anim-breathing" type="checkbox" checked />
+              Endomorphic Breathing (+/−)
+            </label>
+            <button id="btn-gen-anim" class="btn">Stage Morph Frames</button>
+            <button id="btn-gen-anim-play" class="btn btn-primary">Generate, Synthesize &amp; Play Video-Audio</button>
+          </div>
         </div>
       </div>
 

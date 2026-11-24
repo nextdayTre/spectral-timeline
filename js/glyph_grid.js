@@ -332,3 +332,142 @@ export function renderGeometricTestRGBA(width = 640, height = 360) {
   }
   return { rgba, width, height };
 }
+
+// ---------------------------------------------------------------------------
+// Polar SDF Shape Morph Animation (Triangle -> Circle -> Triangle -> Square)
+// Designed as a BPM-synced "video-as-audio" & neuromorphic event-camera litmus test.
+// ---------------------------------------------------------------------------
+function polarRadius(shape, theta) {
+  if (shape === "circle") return 0.78;
+  if (shape === "triangle") {
+    // Regular 3-gon pointing straight up (apex at theta = -PI/2)
+    const sector = (2 * Math.PI) / 3;
+    let a = (theta + Math.PI / 2) % sector;
+    if (a < 0) a += sector;
+    const d = a - sector / 2;
+    return Math.cos(Math.PI / 3) / Math.max(0.15, Math.cos(d)) * 1.12;
+  }
+  if (shape === "square") {
+    // Axis-aligned regular 4-gon (flat top/bottom/sides)
+    const sector = Math.PI / 2;
+    let a = (theta + Math.PI / 4) % sector;
+    if (a < 0) a += sector;
+    const d = a - sector / 2;
+    return Math.cos(Math.PI / 4) / Math.max(0.2, Math.cos(d)) * 0.96;
+  }
+  return 0.78;
+}
+
+/**
+ * Render one morphed shape frame (smoothstep between shapeA and shapeB at t in [0, 1]).
+ * `style`: "outline" (crisp sonar/event contour) | "solid" (filled silhouette for max RMS breath).
+ */
+export function renderShapeMorphFrameRGBA({
+  shapeA = "triangle",
+  shapeB = "circle",
+  t = 0.0,
+  style = "outline",
+  width = 480,
+  height = 360,
+} = {}) {
+  const s = Math.max(0, Math.min(1, Number(t) || 0));
+  const ease = s * s * (3 - 2 * s); // smoothstep ease-in/out
+  const rgba = new Uint8ClampedArray(width * height * 4);
+  for (let i = 3; i < rgba.length; i += 4) rgba[i] = 255;
+
+  const cx = width * 0.5;
+  const cy = height * 0.52;
+  const baseR = Math.min(width, height) * 0.40;
+  const strokeHalf = style === "outline" ? 0.085 : 0.0;
+
+  for (let y = 0; y < height; y++) {
+    const dy = (y - cy) / baseR;
+    const rowOff = y * width;
+    for (let x = 0; x < width; x++) {
+      const dx = (x - cx) / baseR;
+      const dist = Math.hypot(dx, dy);
+      const theta = Math.atan2(dy, dx);
+      const rTarget = (1 - ease) * polarRadius(shapeA, theta) + ease * polarRadius(shapeB, theta);
+
+      let intensity = 0.0;
+      if (style === "solid") {
+        // Anti-aliased solid interior
+        const edge = rTarget - dist;
+        if (edge > 0.03) intensity = 1.0;
+        else if (edge > -0.03) intensity = (edge + 0.03) / 0.06;
+      } else {
+        // Crisp glowing sonar contour + faint harmonic center dot for optical anchor
+        const dLine = Math.abs(dist - rTarget);
+        if (dLine < strokeHalf) {
+          intensity = 1.0;
+        } else if (dLine < strokeHalf + 0.045) {
+          intensity = 1.0 - (dLine - strokeHalf) / 0.045;
+        }
+        if (dist < 0.06) intensity = Math.max(intensity, 0.85);
+      }
+
+      if (intensity > 0.01) {
+        const o = (rowOff + x) * 4;
+        rgba[o] = Math.round(intensity * 115);
+        rgba[o + 1] = Math.round(intensity * 255);
+        rgba[o + 2] = Math.round(intensity * 105);
+      }
+    }
+  }
+  return { rgba, width, height };
+}
+
+/**
+ * Build a BPM-synced "Triangle -> Circle -> Triangle -> Square -> (loop)" morph animation.
+ */
+export function buildShapeMorphSequence({
+  bpm = 120,
+  beatsPerFrame = 0.5,
+  framesPerLeg = 3,
+  style = "outline",
+  breathing = true,
+  width = 480,
+  height = 360,
+} = {}) {
+  const bpmClamped = Math.max(40, Math.min(240, Number(bpm) || 120));
+  const bpf = Math.max(0.25, Math.min(4.0, Number(beatsPerFrame) || 0.5));
+  const fpl = Math.max(2, Math.min(8, Math.round(Number(framesPerLeg) || 3)));
+  const slotDurationS = Number(((60.0 / bpmClamped) * bpf).toFixed(4));
+
+  const legs = [
+    ["triangle", "circle", "Tri→Cir"],
+    ["circle", "triangle", "Cir→Tri"],
+    ["triangle", "square", "Tri→Sq"],
+    ["square", "triangle", "Sq→Tri"],
+  ];
+
+  const frames = [];
+  let idx = 0;
+  for (const [a, b, tag] of legs) {
+    for (let step = 0; step < fpl; step++) {
+      const t = step / fpl;
+      const grid = renderShapeMorphFrameRGBA({ shapeA: a, shapeB: b, t, style, width, height });
+      const polarity = breathing ? (idx % 2 === 0 ? "pos" : "neg") : "pos";
+      const pct = Math.round(t * 100);
+      const name = `${String(idx + 1).padStart(2, "0")}_${tag}_${pct}.png`;
+      frames.push({ index: idx, filename: name, shapeA: a, shapeB: b, t, polarity, grid });
+      idx++;
+    }
+  }
+
+  // Pick crisp STFT & boundary fade parameters matched to BPM frame duration
+  const fftSize = slotDurationS < 0.35 ? 1024 : (slotDurationS < 1.0 ? 2048 : 4096);
+  const slotGapMs = slotDurationS < 0.35 ? 6.0 : (slotDurationS < 0.8 ? 10.0 : 18.0);
+  const pps = slotDurationS < 0.35 ? 160 : 120;
+
+  return {
+    bpm: bpmClamped,
+    beatsPerFrame: bpf,
+    slotDurationS,
+    fftSize,
+    slotGapMs,
+    pps,
+    frames,
+  };
+}
+

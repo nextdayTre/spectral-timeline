@@ -12,6 +12,7 @@ import {
 } from "./dsp.js";
 import {
   buildSecp256k1BreathingCards,
+  buildShapeMorphSequence,
   renderGeometricTestRGBA,
   renderUniformPixelBoxRGBA,
 } from "./glyph_grid.js";
@@ -71,12 +72,17 @@ const app = {
 
   // Rendered master artifacts
   masterSpecCanvas: null,
+  stftRawFrames: [],    // Canvas[] sliced directly from synthesized WAV STFT
+  stftDemodFrames: [],  // Canvas[] with negative polarity un-flipped live
+  stftEventFrames: [],  // Canvas[] neuromorphic Event-Camera (+ON cyan / -OFF amber) diff
   masterWavUrl: null,
   masterWavBytes: 0,
   audioBuffer: null,
 
   // View / playback state
-  monMode: "seam", // "clip" | "master" | "seam"
+  monMode: "seam",      // "clip" | "master" | "seam" | "video"
+  videoMode: "demod",   // "demod" | "raw" | "event"
+  activeBpm: 120,
   selectedClipIdx: 0,
   selectedSeamIdx: 0,
   dragPayload: null,
@@ -227,7 +233,86 @@ function ensureWorker() {
   return app.worker;
 }
 
-function synthesizeMaster(autoDownload = false) {
+function buildDecodedStftFrames(specRgba, specW, specH, frameW, numClips) {
+  const rawFrames = [];
+  const demodFrames = [];
+  const demodLuma = [];
+
+  for (let k = 0; k < numClips; k++) {
+    const x0 = k * frameW;
+    const rawArr = new Uint8ClampedArray(frameW * specH * 4);
+    const demArr = new Uint8ClampedArray(frameW * specH * 4);
+    const luma = new Float32Array(frameW * specH);
+    const isNeg = app.clips[k] && app.clips[k].polarity === "neg";
+
+    // Trim 4% edge margin inside each slot to reduce boundary fade dimness in flipbook view
+    let minG = 255, maxG = 0;
+    for (let y = 0; y < specH; y++) {
+      for (let x = 0; x < frameW; x++) {
+        const srcO = (y * specW + (x0 + x)) * 4;
+        const dstO = (y * frameW + x) * 4;
+        const r = specRgba[srcO], g = specRgba[srcO + 1], b = specRgba[srcO + 2];
+        rawArr[dstO] = r; rawArr[dstO + 1] = g; rawArr[dstO + 2] = b; rawArr[dstO + 3] = 255;
+        if (x >= 4 && x < frameW - 4) {
+          if (g < minG) minG = g;
+          if (g > maxG) maxG = g;
+        }
+      }
+    }
+
+    const span = Math.max(24, maxG - minG);
+    for (let y = 0; y < specH; y++) {
+      for (let x = 0; x < frameW; x++) {
+        const o = (y * frameW + x) * 4;
+        const gNorm = Math.min(1, Math.max(0, (rawArr[o + 1] - minG) / span));
+        // If negative polarity, invert carved-silence notch back into glowing bright shape
+        let v = isNeg ? Math.max(0, Math.min(1, 1.0 - gNorm)) : gNorm;
+        // Suppress dim boundary-fade edges on inverted frames so frame walls don't glow white
+        if (isNeg && (x < 5 || x >= frameW - 5)) v = 0;
+        luma[y * frameW + x] = v;
+        demArr[o] = Math.round(Math.pow(v, 2.2) * 180);
+        demArr[o + 1] = Math.round(v * 255);
+        demArr[o + 2] = Math.round(Math.pow(v, 1.8) * 140);
+        demArr[o + 3] = 255;
+      }
+    }
+
+    rawFrames.push(rgbaToCanvas(rawArr, frameW, specH));
+    demodFrames.push(rgbaToCanvas(demArr, frameW, specH));
+    demodLuma.push(luma);
+  }
+
+  // Neuromorphic Event-Camera (Δ +ON cyan / -OFF amber) between consecutive decoded STFT frames
+  const eventFrames = [];
+  for (let k = 0; k < numClips; k++) {
+    const prev = demodLuma[(k - 1 + numClips) % numClips];
+    const curr = demodLuma[k];
+    const evArr = new Uint8ClampedArray(frameW * specH * 4);
+    for (let i = 0; i < curr.length; i++) {
+      const d = curr[i] - prev[i];
+      const o = i * 4;
+      if (d > 0.08) {
+        const mag = Math.min(1, (d - 0.08) / 0.55);
+        evArr[o] = Math.round(mag * 35);
+        evArr[o + 1] = Math.round(mag * 235);
+        evArr[o + 2] = Math.round(mag * 255);
+      } else if (d < -0.08) {
+        const mag = Math.min(1, (-d - 0.08) / 0.55);
+        evArr[o] = Math.round(mag * 255);
+        evArr[o + 1] = Math.round(mag * 115);
+        evArr[o + 2] = Math.round(mag * 30);
+      }
+      evArr[o + 3] = 255;
+    }
+    eventFrames.push(rgbaToCanvas(evArr, frameW, specH));
+  }
+
+  app.stftRawFrames = rawFrames;
+  app.stftDemodFrames = demodFrames;
+  app.stftEventFrames = eventFrames;
+}
+
+function synthesizeMaster({ autoDownload = false, openVideoAndPlay = false } = {}) {
   if (app.clips.length === 0) {
     app.statusNote = "Add at least one clip to the timeline before synthesizing.";
     renderUI();
@@ -267,8 +352,10 @@ function synthesizeMaster(autoDownload = false) {
       app.masterWavUrl = URL.createObjectURL(wavBlob);
       app.masterWavBytes = wavBlob.size;
 
-      // Master Spectrogram Canvas
-      app.masterSpecCanvas = rgbaToCanvas(new Uint8ClampedArray(msg.specRgbaBuf), msg.specW, msg.specH);
+      // Master Spectrogram Canvas + Live Decoded STFT Video Frames
+      const specRgba = new Uint8ClampedArray(msg.specRgbaBuf);
+      app.masterSpecCanvas = rgbaToCanvas(specRgba, msg.specW, msg.specH);
+      buildDecodedStftFrames(specRgba, msg.specW, msg.specH, msg.frameW, msg.numClips);
 
       // Decode browser playback AudioBuffer
       try {
@@ -281,13 +368,17 @@ function synthesizeMaster(autoDownload = false) {
 
       app.dirty = false;
       app.rendered = true;
-      app.monMode = "master";
+      app.monMode = openVideoAndPlay ? "video" : "master";
       app.statusNote = `Lossless ${app.cfg.sr / 1000} kHz / ${app.cfg.bitDepth}-bit WAV ready (${(wavBlob.size / 1024).toFixed(0)} KB · ${msg.elapsedMs.toFixed(0)} ms)`;
       renderUI();
 
+      if (openVideoAndPlay) {
+        app.loop = true;
+        $("btn-loop").classList.add("active");
+        startPlayback(0);
+      }
       if (autoDownload) {
-        const a = $("btn-dl-wav");
-        a.click();
+        $("btn-dl-wav").click();
       }
     }
   };
@@ -368,6 +459,56 @@ function drawLoop() {
   ctx.fillStyle = "#080a0d";
   ctx.fillRect(0, 0, w, h);
 
+  const dur = Math.max(0.001, totalDurationS());
+  if (app.monMode === "video") {
+    const frames = app.videoMode === "raw"
+      ? app.stftRawFrames
+      : app.videoMode === "event"
+        ? app.stftEventFrames
+        : app.stftDemodFrames;
+
+    if (frames.length > 0 && app.rendered) {
+      const t = currentPlayheadSec();
+      const idx = app.playing
+        ? Math.min(frames.length - 1, Math.floor((t / dur) * frames.length))
+        : Math.min(frames.length - 1, app.selectedClipIdx);
+      const fr = frames[idx];
+      // Preserve clean 4:3 video monitor framing inside canvas
+      const targetAspect = 4 / 3;
+      const padY = 44 * dpr;
+      const availH = Math.max(40, h - padY * 1.3);
+      const drawH = availH;
+      const drawW = Math.min(w - 24 * dpr, drawH * targetAspect);
+      const dx = Math.floor((w - drawW) / 2);
+      const dy = Math.floor((h - drawH) / 2 + 8 * dpr);
+
+      ctx.imageSmoothingEnabled = true;
+      ctx.drawImage(fr, dx, dy, drawW, drawH);
+      ctx.strokeStyle = (app.clips[idx]?.polarity === "neg") ? "rgba(72, 201, 240, 0.55)" : "rgba(56, 212, 122, 0.55)";
+      ctx.lineWidth = Math.max(1.5, dpr);
+      ctx.strokeRect(dx, dy, drawW, drawH);
+
+      // Thin BPM playhead scrub bar along bottom
+      const barH = 4 * dpr;
+      ctx.fillStyle = "rgba(255,255,255,0.1)";
+      ctx.fillRect(dx, dy + drawH + 6 * dpr, drawW, barH);
+      ctx.fillStyle = "#38d47a";
+      ctx.fillRect(dx, dy + drawH + 6 * dpr, drawW * (t / dur), barH);
+
+      const polTag = app.clips[idx]?.polarity === "neg" ? "− NEG" : "+ POS";
+      $("video-frame-badge").textContent = `Frame ${idx + 1}/${frames.length} · ${polTag} · ${app.clips[idx]?.title || ""}`;
+      $("hud-time").textContent = `${t.toFixed(2)} / ${totalDurationS().toFixed(2)} s`;
+    } else {
+      ctx.fillStyle = "#5c677a";
+      ctx.font = `${13 * dpr}px ui-monospace, monospace`;
+      ctx.textAlign = "center";
+      ctx.fillText("Click Synthesize WAV (or Shape Morph → Generate & Play) to decode live STFT video", w / 2, h / 2);
+      $("video-frame-badge").textContent = "Not synthesized";
+    }
+    requestAnimationFrame(drawLoop);
+    return;
+  }
+
   let srcCanvas = null;
   if (app.monMode === "master") {
     srcCanvas = app.masterSpecCanvas;
@@ -387,7 +528,6 @@ function drawLoop() {
     ctx.fillText("Stage images in Media Bay → arrange Timeline → click Synthesize WAV", w / 2, h / 2);
   }
 
-  const dur = Math.max(0.001, totalDurationS());
   if (app.monMode === "master" && app.clips.length > 0) {
     const n = app.clips.length;
     ctx.strokeStyle = "rgba(255, 255, 255, 0.14)";
@@ -455,8 +595,15 @@ function renderUI() {
   // Monitor header & legend
   document.querySelectorAll(".mon-tab").forEach((b) => b.classList.toggle("active", b.dataset.mon === app.monMode));
   $("seam-legend").classList.toggle("hidden", app.monMode !== "seam");
+  $("video-bar").classList.toggle("hidden", app.monMode !== "video");
+  document.querySelectorAll(".vmode-btn").forEach((b) => b.classList.toggle("active", b.dataset.vmode === app.videoMode));
 
-  if (app.monMode === "master") {
+  if (app.monMode === "video") {
+    const fps = (1 / Math.max(0.05, Number(app.cfg.slotDurationS) || 0.5)).toFixed(1);
+    $("mon-info").textContent = app.rendered
+      ? `Live STFT Video Decoded from WAV · ${fps} fps (${app.cfg.slotDurationS}s/slot) · Press Space to Play`
+      : "Synthesize WAV to decode & animate live from the audio spectrogram";
+  } else if (app.monMode === "master") {
     $("mon-info").textContent = app.rendered
       ? `Master ${app.cfg.sr / 1000}kHz/${app.cfg.bitDepth}b · ${app.cfg.fMinHz}–${app.cfg.fMaxHz} Hz${app.dirty ? " (STALE)" : ""}`
       : "Not synthesized yet — click Synthesize WAV";
@@ -599,7 +746,13 @@ function renderUI() {
     });
     card.addEventListener("click", () => {
       app.selectedClipIdx = idx;
-      app.monMode = "clip";
+      if (app.monMode === "video" && app.rendered) {
+        const t = idx * (Number(app.cfg.slotDurationS) || 0.5);
+        app.playOffset = t;
+        if (app.playing) startPlayback(t);
+      } else {
+        app.monMode = "clip";
+      }
       renderUI();
     });
     card.querySelectorAll("[data-act]").forEach((btn) => {
@@ -827,7 +980,7 @@ function bindEvents() {
   });
 
   $("btn-apply-cfg").addEventListener("click", () => {
-    app.cfg.slotDurationS = Math.max(0.5, Math.min(10, parseFloat($("cfg-slot-s").value) || 2.0));
+    app.cfg.slotDurationS = Math.max(0.125, Math.min(10, parseFloat($("cfg-slot-s").value) || 2.0));
     app.cfg.fMinHz = Math.max(20, parseFloat($("cfg-fmin").value) || 120);
     app.cfg.fMaxHz = Math.max(app.cfg.fMinHz + 100, parseFloat($("cfg-fmax").value) || 18500);
     app.cfg.freqScale = $("cfg-scale").value;
@@ -838,6 +991,54 @@ function bindEvents() {
     app.cfg.preserveBreathingContrast = $("cfg-preserve-breathing").checked;
     app.clips.forEach((c) => { c.condMode = app.cfg.condMode; });
     markDirty("Updated synth settings (click Synthesize WAV)");
+  });
+
+  function stageShapeMorphAnimation(andPlay = false) {
+    const bpm = parseFloat($("anim-bpm").value) || 120;
+    const beatsPerFrame = parseFloat($("anim-bpf").value) || 0.5;
+    const framesPerLeg = parseInt($("anim-fpl").value, 10) || 3;
+    const style = $("anim-style").value || "outline";
+    const breathing = $("anim-breathing").checked;
+
+    const seq = buildShapeMorphSequence({ bpm, beatsPerFrame, framesPerLeg, style, breathing });
+    app.activeBpm = seq.bpm;
+    app.cfg.slotDurationS = seq.slotDurationS;
+    app.cfg.fftSize = seq.fftSize;
+    app.cfg.slotGapMs = seq.slotGapMs;
+    app.cfg.pps = seq.pps;
+    // Fast, super-crisp sonar/video band for responsive browser synthesis
+    app.cfg.fMinHz = 320;
+    app.cfg.fMaxHz = 7800;
+    app.cfg.partials = 160;
+    app.cfg.condMode = "raw";
+    app.cfg.freqScale = "linear";
+
+    app.clips = [];
+    app.breathingEnabled = false;
+    for (const fr of seq.frames) {
+      const m = addMediaFromRGBA(fr.filename, fr.grid.rgba, fr.grid.width, fr.grid.height);
+      addClip(m.mediaId, fr.polarity, null);
+    }
+    app.breathingEnabled = breathing;
+    app.selectedClipIdx = 0;
+    app.selectedSeamIdx = 0;
+    app.monMode = andPlay ? "video" : "seam";
+    markDirty(
+      `Staged ${seq.frames.length}-frame Tri→Cir→Tri→Sq morph @ ${seq.bpm} BPM (${seq.slotDurationS}s/frame, ${(1 / seq.slotDurationS).toFixed(1)} fps)`
+    );
+    if (andPlay) {
+      synthesizeMaster({ autoDownload: false, openVideoAndPlay: true });
+    }
+  }
+
+  $("btn-gen-anim").addEventListener("click", () => stageShapeMorphAnimation(false));
+  $("btn-gen-anim-play").addEventListener("click", () => stageShapeMorphAnimation(true));
+
+  document.querySelectorAll(".vmode-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      app.videoMode = btn.dataset.vmode;
+      renderUI();
+    });
   });
 
   $("btn-gen-secp").addEventListener("click", () => {
@@ -880,8 +1081,8 @@ function bindEvents() {
     renderUI();
   });
 
-  $("btn-render").addEventListener("click", () => synthesizeMaster(false));
-  $("btn-export-wav2").addEventListener("click", () => synthesizeMaster(true));
+  $("btn-render").addEventListener("click", () => synthesizeMaster({ autoDownload: false }));
+  $("btn-export-wav2").addEventListener("click", () => synthesizeMaster({ autoDownload: true }));
   $("btn-export-json").addEventListener("click", downloadTimelineJSON);
 
   document.querySelectorAll(".mon-tab").forEach((btn) => {

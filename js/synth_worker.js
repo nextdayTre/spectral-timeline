@@ -21,7 +21,9 @@ self.onmessage = (ev) => {
     const playWav = cfg.bitDepth === 16 ? masterWav.slice() : encodeWavMono(audio, cfg.sr, 16);
 
     self.postMessage({ type: "progress", jobId, frac: 0.92, stage: "Rendering STFT spectrogram" });
-    const spec = renderStftSpectrogramRGBA(audio, cfg, 1280, 360, -78.0);
+    const nClips = Math.max(1, planes.length);
+    const frameW = Math.max(64, Math.min(180, Math.floor(1920 / nClips)));
+    const spec = renderStftSpectrogramRGBA(audio, cfg, frameW * nClips, 320, -78.0);
     const elapsedMs = performance.now() - t0;
 
     self.postMessage(
@@ -35,6 +37,8 @@ self.onmessage = (ev) => {
         specRgbaBuf: spec.rgba.buffer,
         specW: spec.width,
         specH: spec.height,
+        frameW,
+        numClips: nClips,
       },
       [masterWav.buffer, playWav.buffer, spec.rgba.buffer]
     );

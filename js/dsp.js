@@ -585,8 +585,8 @@ export function renderStftSpectrogramRGBA(audio, cfg, outW = 1200, outH = 340, d
   }
   const normScale = 2.0 / Math.max(1e-9, winSum);
 
-  // Sample `outW` evenly spaced STFT frames across the audio timeline
-  const nFrames = Math.min(outW, Math.max(64, Math.floor(audio.length / (fft / 4))));
+  // Sample exact `outW` evenly spaced STFT frames across the audio timeline (exact clip-slice alignment)
+  const nFrames = Math.max(16, Math.round(outW));
   const mags = new Float32Array(nFrames * outH);
 
   // Precompute vertical bin mapping for each output row (top-down -> high Hz at row 0)

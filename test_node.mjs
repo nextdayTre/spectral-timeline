@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import {
   SECP256K1_P,
   buildSecp256k1BreathingCards,
+  buildShapeMorphSequence,
   renderUniformPixelBoxRGBA,
   secp256k1PairHex,
   secp256k1ScalarMul,
@@ -117,6 +118,54 @@ import {
     assert.equal(dv.getUint16(34, true), bd);
   }
   console.log(`[PASS] Schroeder additive synth + breathing contrast (pos=${slotRmsDb[0]} dB vs neg=${slotRmsDb[1]} dB, ${ms.toFixed(0)} ms) + 16b/24b/32f WAV`);
+}
+
+// 5. BPM-synced Polar Shape Morph Animation (Triangle -> Circle -> Triangle -> Square) + exact STFT slicing
+{
+  const seq = buildShapeMorphSequence({ bpm: 120, beatsPerFrame: 0.5, framesPerLeg: 3, style: "outline", breathing: true });
+  assert.equal(seq.slotDurationS, 0.25);
+  assert.equal(seq.frames.length, 12);
+  assert.equal(seq.fftSize, 1024);
+  for (let i = 0; i < seq.frames.length; i++) {
+    assert.equal(seq.frames[i].polarity, i % 2 === 0 ? "pos" : "neg");
+  }
+
+  const animCfg = {
+    ...defaultConfig(),
+    slotDurationS: seq.slotDurationS,
+    fftSize: seq.fftSize,
+    slotGapMs: seq.slotGapMs,
+    pps: seq.pps,
+    fMinHz: 320,
+    fMaxHz: 7800,
+    partials: 120,
+    sr: 48000,
+    bitDepth: 24,
+  };
+  const freqs = buildFreqGrid(animCfg);
+  const planes = seq.frames.map((fr) =>
+    rgbaToConditionedPlane(fr.grid.rgba, fr.grid.width, fr.grid.height, animCfg, fr.polarity, "raw", true)
+  );
+  const t0 = performance.now();
+  const { audio, slotRmsDb } = renderTimelineAudio(
+    planes.map((p) => p.plane),
+    planes[0].P,
+    planes[0].C,
+    freqs,
+    animCfg
+  );
+  const ms = performance.now() - t0;
+
+  const frameW = 96;
+  const spec = renderStftSpectrogramRGBA(audio, animCfg, frameW * seq.frames.length, 160);
+  assert.equal(spec.width, frameW * seq.frames.length, "STFT width must match exact numClips * frameW");
+
+  const posAvg = slotRmsDb.filter((_, i) => i % 2 === 0).reduce((a, b) => a + b, 0) / 6;
+  const negAvg = slotRmsDb.filter((_, i) => i % 2 === 1).reduce((a, b) => a + b, 0) / 6;
+  assert.ok(negAvg > posAvg + 1.5, `Expected breathing contrast across 12 morph frames: pos=${posAvg}, neg=${negAvg}`);
+  console.log(
+    `[PASS] BPM shape morph video-as-audio (12 frames @ 120 BPM / 0.25s, pos=${posAvg.toFixed(1)} dB vs neg=${negAvg.toFixed(1)} dB, ${ms.toFixed(0)} ms, STFT=${spec.width}x${spec.height})`
+  );
 }
 
 console.log("\nALL SPECTRAL TIMELINE BROWSER-ENGINE SELF-TESTS PASSED.");

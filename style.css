@@ -307,6 +307,42 @@ html, body {
 .sw-10 { background: #ff5f23; }
 .sw-00 { background: #0a0c10; }
 
+.video-bar {
+  position: absolute;
+  top: 10px;
+  left: 12px;
+  background: rgba(14, 17, 22, 0.90);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 4px 6px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10px;
+}
+.vmode-btn {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid transparent;
+  border-radius: 3px;
+  padding: 2px 7px;
+  font-size: 10px;
+  cursor: pointer;
+}
+.vmode-btn.active {
+  color: var(--green);
+  border-color: var(--green);
+  background: var(--green-dim);
+}
+.vframe-badge {
+  color: var(--cyan);
+  padding: 0 6px;
+  border-left: 1px solid var(--border);
+}
+.ctrl-row select#anim-bpf,
+.ctrl-row select#anim-style { width: 175px; }
+.ctrl-row select#anim-fpl { width: 125px; }
+
 .transport {
   height: 36px;
   padding: 0 10px;
