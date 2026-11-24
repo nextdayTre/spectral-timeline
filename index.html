@@ -12,20 +12,24 @@
     <header class="topbar">
       <div class="tb-left">
         <span class="brand">SPECTRAL TIMELINE</span>
-        <span id="status-pill" class="pill pill-dirty">PRE-SYNTH</span>
-        <span id="format-pill" class="pill mono">48 kHz / 24-bit</span>
+        <span class="fas-box">
+          <span id="fas-led" class="led led-off" title="Fragment Audio Server status"></span>
+          <input id="fas-addr" type="text" class="mono fas-addr-input" value="127.0.0.1:3003" title="Fragment Audio Server WebSocket address" />
+          <button id="btn-fas-connect" class="mini-btn" title="Connect to local Fragment Audio Server (grz0zrg/fas)">Connect FAS</button>
+          <span id="fas-telemetry" class="mono muted fas-tel"></span>
+        </span>
       </div>
       <div class="tb-center mono">
         <span id="hud-time">0.00 / 4.00 s</span>
         <span class="sep">|</span>
-        <span id="hud-note" class="muted">100% browser-native · stage media and click Synthesize WAV</span>
+        <span id="hud-note" class="muted">Connect FAS (ws://127.0.0.1:3003) for real-time 512-osc Fragment synth</span>
       </div>
       <div class="tb-right">
         <label class="gain-wrap mono">
           Gain
-          <input id="gain-input" type="number" min="0" max="1" step="0.05" value="0.35" />
+          <input id="gain-input" type="number" min="0" max="1" step="0.02" value="0.12" />
         </label>
-        <button id="btn-render" class="btn btn-primary">Synthesize WAV</button>
+        <button id="btn-render" class="btn" title="Optional offline browser WAV render (fallback when FAS is offline)">Offline WAV</button>
         <a id="btn-dl-wav" class="btn hidden" download="spectral_timeline.wav">Download WAV</a>
       </div>
     </header>
@@ -46,10 +50,11 @@
       <main class="monitor">
         <div class="panel-hdr">
           <div class="mon-tabs">
-            <button class="mon-tab active" data-mon="clip">Clip Preview</button>
-            <button class="mon-tab" data-mon="master">Master Spectrogram</button>
+            <button class="mon-tab active" data-mon="timeline">Timeline Stream (FAS)</button>
+            <button class="mon-tab" data-mon="clip">Clip Preview</button>
             <button class="mon-tab" data-mon="seam">Seam Delta (4-State)</button>
-            <button class="mon-tab" data-mon="video">Video-as-Audio (STFT)</button>
+            <button class="mon-tab" data-mon="video">Video-as-Audio</button>
+            <button class="mon-tab" data-mon="master">Offline WAV STFT</button>
           </div>
           <div class="mon-info mono muted" id="mon-info">Select a clip or click Synthesize WAV</div>
         </div>
@@ -73,10 +78,10 @@
 
         <div class="transport">
           <button id="btn-rewind" class="mini-btn" title="Rewind">|&lt;</button>
-          <button id="btn-play" class="mini-btn" title="Play / Pause (Space)">Play</button>
+          <button id="btn-play" class="mini-btn btn-primary" title="Play / Pause via FAS (or Offline WAV fallback) [Space]">Play</button>
           <button id="btn-loop" class="mini-btn active" title="Loop">Loop</button>
           <span class="sep">|</span>
-          <span class="mono muted">Browser WebAudio · 100% Client-Side</span>
+          <span id="engine-badge" class="mono muted">Engine: FAS Offline (click Connect FAS or Offline WAV)</span>
           <span class="spacer"></span>
           <span id="breathing-rms-lbl" class="mono muted"></span>
         </div>
@@ -103,61 +108,59 @@
     <!-- BOTTOM DOCK -->
     <footer class="dock">
       <div class="dock-tabs">
-        <button class="dock-tab active" data-dock="synth">Synth &amp; Breathing</button>
+        <button class="dock-tab active" data-dock="synth">Fragment Synth (FAS)</button>
         <button class="dock-tab" data-dock="anim">Shape Morph (BPM)</button>
         <button class="dock-tab" data-dock="cards">Hex / K·G Cards</button>
         <button class="dock-tab" data-dock="deltas">Endomorphic Deltas</button>
-        <button class="dock-tab" data-dock="deliver">Export / Manifest</button>
+        <button class="dock-tab" data-dock="deliver">Export / Strip / WAV</button>
       </div>
 
       <div id="dock-synth" class="dock-panel active">
         <div class="ctrl-row">
-          <label>Preset
-            <select id="cfg-preset"></select>
+          <label>FAS Synth Method (Live!)
+            <select id="fas-method"></select>
           </label>
-          <label>Slot ΔT (s)
-            <input id="cfg-slot-s" type="number" min="0.125" max="10" step="0.05" />
-          </label>
-          <label>Min Hz
-            <input id="cfg-fmin" type="number" step="10" />
-          </label>
-          <label>Max Hz
-            <input id="cfg-fmax" type="number" step="100" />
-          </label>
-          <label>Scale
-            <select id="cfg-scale">
-              <option value="linear">linear</option>
-              <option value="log">log</option>
+          <label>Bank Height (Oscs)
+            <select id="fas-height">
+              <option value="256">256 oscs</option>
+              <option value="512" selected>512 oscs (Fragment std)</option>
+              <option value="768">768 oscs</option>
+              <option value="1024">1024 oscs</option>
             </select>
           </label>
-          <label>Partials
-            <input id="cfg-partials" type="number" min="32" max="516" step="8" />
+          <label>Octaves
+            <input id="fas-octaves" type="number" min="2" max="12" step="1" value="10" />
           </label>
-          <label>Mode
+          <label>Base Freq (Hz)
+            <input id="fas-basefreq" type="number" min="8" max="200" step="0.05" value="16.35" />
+          </label>
+          <label>Stream FPS
+            <select id="fas-fps">
+              <option value="30">30 fps</option>
+              <option value="60" selected>60 fps</option>
+              <option value="120">120 fps</option>
+            </select>
+          </label>
+          <label>Stereo Routing
+            <select id="fas-stereo">
+              <option value="mono" selected>Center Mono (R=G)</option>
+              <option value="breath_lr">Breathing L/R (+Left / −Right)</option>
+            </select>
+          </label>
+          <label>Slot ΔT (s)
+            <input id="cfg-slot-s" type="number" min="0.125" max="10" step="0.05" value="2.0" />
+          </label>
+          <label>Condition
             <select id="cfg-cond">
               <option value="raw">raw</option>
               <option value="stroke">stroke</option>
             </select>
           </label>
-          <label>Sample Rate
-            <select id="cfg-sr">
-              <option value="44100">44.1 kHz</option>
-              <option value="48000">48 kHz</option>
-              <option value="96000">96 kHz</option>
-            </select>
-          </label>
-          <label>WAV Depth
-            <select id="cfg-bit-depth">
-              <option value="16">16-bit PCM</option>
-              <option value="24">24-bit PCM</option>
-              <option value="32">32-bit Float</option>
-            </select>
-          </label>
-          <label class="chk-label" title="Bypass per-column RMS equalization when inverted clips are present">
-            <input id="cfg-preserve-breathing" type="checkbox" checked />
-            Preserve Breathing Contrast
-          </label>
-          <button id="btn-apply-cfg" class="mini-btn">Apply</button>
+          <button id="btn-apply-cfg" class="mini-btn">Sync to FAS</button>
+        </div>
+        <div class="fas-help mono muted">
+          Run local <code>fas.exe --sample_rate 48000</code> (or <code>--render session</code> to record WAV directly from FAS) from
+          <a href="https://github.com/grz0zrg/fas/releases/tag/v2.0.2" target="_blank" rel="noopener">grz0zrg/fas v2.0.2</a>, then click <b>Connect FAS</b>.
         </div>
       </div>
 
@@ -264,9 +267,10 @@
 
       <div id="dock-deliver" class="dock-panel">
         <div class="deliver-row">
-          <button id="btn-export-wav2" class="btn btn-primary">Synthesize &amp; Download Lossless WAV</button>
-          <button id="btn-export-json" class="btn">Download Seam Delta &amp; Timeline JSON</button>
-          <span class="mono muted" id="deliver-note">Outputs pure RIFF WAV (16/24-bit PCM or 32-bit float) ready for iZotope RX11.</span>
+          <button id="btn-export-strip" class="btn btn-primary">Export Stitched Breathing Strip (.png)</button>
+          <button id="btn-export-wav2" class="btn">Offline Browser WAV (48k/24b)</button>
+          <button id="btn-export-json" class="btn">Download Seam Delta JSON</button>
+          <span class="mono muted" id="deliver-note">Tip: Use <code>fas.exe --render out</code> for native C11 FAS WAV recording, or drop the stitched PNG into Harmor / fsynth.</span>
         </div>
       </div>
     </footer>

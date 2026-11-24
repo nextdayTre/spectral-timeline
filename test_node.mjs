@@ -3,6 +3,16 @@
 
 import assert from "node:assert/strict";
 import {
+  FAS_VOID,
+  buildActionPacket,
+  buildBankSettingsPacket,
+  buildChannelSettingsPacket,
+  buildFrameDataPacket,
+  buildInstrumentSettingsPacket,
+  buildSynthSettingsPacket,
+  parseStreamInfosPacket,
+} from "./js/fas_client.js";
+import {
   SECP256K1_P,
   buildSecp256k1BreathingCards,
   buildShapeMorphSequence,
@@ -166,6 +176,49 @@ import {
   console.log(
     `[PASS] BPM shape morph video-as-audio (12 frames @ 120 BPM / 0.25s, pos=${posAvg.toFixed(1)} dB vs neg=${negAvg.toFixed(1)} dB, ${ms.toFixed(0)} ms, STFT=${spec.width}x${spec.height})`
   );
+}
+
+// 6. Exact Fragment Audio Server (grz0zrg/fas v2.0.2) binary WebSocket packet layouts
+{
+  const bank = buildBankSettingsPacket({ h: 512, octaves: 10, floatData: false, baseFreq: 16.35 });
+  assert.equal(bank.byteLength, 32);
+  assert.equal(new Uint8Array(bank, 0, 1)[0], 0);
+  assert.deepEqual(Array.from(new Uint32Array(bank, 8, 3)), [512, 10, 0]);
+  assert.equal(new Float64Array(bank, 24, 1)[0], 16.35);
+
+  const synth = buildSynthSettingsPacket(0, 60);
+  assert.equal(synth.byteLength, 24);
+  assert.equal(new Uint8Array(synth, 0, 1)[0], 2);
+  assert.equal(new Uint8Array(synth, 8, 1)[0], 0);
+  assert.equal(new Float64Array(synth, 16, 1)[0], 60);
+
+  const chn = buildChannelSettingsPacket(0, 1, 0);
+  assert.equal(chn.byteLength, 24);
+  assert.equal(new Uint8Array(chn, 0, 1)[0], 3);
+
+  const instr = buildInstrumentSettingsPacket(1, 0, FAS_VOID);
+  assert.equal(instr.byteLength, 24);
+  assert.equal(new Uint8Array(instr, 0, 1)[0], 6);
+  assert.equal(new Float64Array(instr, 16, 1)[0], 15);
+
+  const act = buildActionPacket(5);
+  assert.equal(act.byteLength, 8);
+  assert.deepEqual(Array.from(new Uint8Array(act, 0, 2)), [5, 5]);
+
+  const slice = new Uint8Array(512 * 4);
+  slice[0] = 255; slice[1] = 255; slice[3] = 255;
+  const frame = buildFrameDataPacket(slice, false);
+  assert.equal(frame.byteLength, 16 + 512 * 4);
+  assert.equal(new Uint8Array(frame, 0, 1)[0], 1);
+  assert.equal(new Uint32Array(frame, 8, 1)[0], 1);
+  assert.equal(new Uint8Array(frame, 16, 4)[0], 255);
+
+  const telBuf = new ArrayBuffer(16);
+  new Int32Array(telBuf, 0, 2).set([0, 27]);
+  new Float64Array(telBuf, 8, 1)[0] = 4.25;
+  const tel = parseStreamInfosPacket(telBuf);
+  assert.deepEqual(tel, { load: 27, latencyMs: 4.25 });
+  console.log("[PASS] Fragment Audio Server (grz0zrg/fas) binary protocol packets (IDs 0,1,2,3,5,6 + telemetry)");
 }
 
 console.log("\nALL SPECTRAL TIMELINE BROWSER-ENGINE SELF-TESTS PASSED.");

@@ -65,6 +65,48 @@ html, body {
   color: var(--green);
 }
 
+.fas-box {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 6px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+}
+.led {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+}
+.led-off { background: #4a5263; }
+.led-on { background: var(--green); box-shadow: 0 0 8px var(--green); }
+.led-err { background: var(--danger); }
+.fas-addr-input {
+  width: 118px;
+  background: transparent;
+  border: none;
+  color: var(--text);
+  font-size: 11px;
+  outline: none;
+}
+.fas-tel { font-size: 10px; }
+.fas-help {
+  margin-top: 7px;
+  font-size: 10px;
+}
+.fas-help a { color: var(--cyan); }
+.fas-help code, #deliver-note code {
+  background: var(--bg);
+  padding: 1px 4px;
+  border-radius: 3px;
+  color: var(--text);
+}
+.ctrl-row select#fas-method { width: 158px; }
+.ctrl-row select#fas-height { width: 138px; }
+.ctrl-row select#fas-stereo { width: 165px; }
+
 .pill {
   padding: 2px 8px;
   border-radius: 4px;

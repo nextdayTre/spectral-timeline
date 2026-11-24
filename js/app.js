@@ -1,8 +1,8 @@
-// Spectral Timeline — 100% Browser-Native Resolve-Style Image-to-Spectrogram Synthesizer
-// Zero backend, zero CLI required — ready for GitHub Pages.
+// Spectral Timeline — Resolve-Style Timeline + Fragment Audio Server (grz0zrg/fas) Backend
+// Primary engine: Real-time C11 Fragment Audio Server (ws://127.0.0.1:3003, 512+ oscillators @ 60fps).
+// Fallback / export: Stitched PNG Strip exporter + optional Offline Browser WAV Worker.
 
 import {
-  PRESETS,
   buildFreqGrid,
   computeSeamDelta,
   defaultConfig,
@@ -10,6 +10,7 @@ import {
   renderSeamDeltaRGBA,
   rgbaToConditionedPlane,
 } from "./dsp.js";
+import { FAS_SYNTH_METHODS, FasClient } from "./fas_client.js";
 import {
   buildSecp256k1BreathingCards,
   buildShapeMorphSequence,
@@ -22,7 +23,6 @@ const $ = (id) => document.getElementById(id);
 const canvas = $("monitor-canvas");
 const ctx = canvas.getContext("2d");
 
-// Helper: convert RGBA Uint8ClampedArray -> offscreen Canvas (fast drawImage & dataURL thumbnails)
 function rgbaToCanvas(rgba, w, h) {
   const c = document.createElement("canvas");
   c.width = w;
@@ -48,59 +48,111 @@ function makeThumbDataUrl(rgba, w, h, tw = 240, th = 135) {
 }
 
 const app = {
-  cfg: defaultConfig(),
+  // FAS settings (primary real-time backend)
+  fasCfg: {
+    address: localStorage.getItem("st-fas-addr") || "127.0.0.1:3003",
+    h: 512,
+    octaves: 10,
+    baseFreq: 16.35,
+    fps: 60,
+    gain: 0.12,
+    method: 0, // 0 = FAS_ADDITIVE
+    stereoMode: "mono", // "mono" | "breath_lr"
+  },
+  fasConnected: false,
+  fasLoad: null,
+  fasLatencyMs: null,
+
+  // Timeline & conditioning config
+  cfg: {
+    ...defaultConfig(),
+    partials: 512,
+    freqScale: "log",
+    fMinHz: 16.35,
+    fMaxHz: 16742,
+    pps: 60,
+  },
   breathingEnabled: true,
   dirty: true,
   rendered: false,
   lastRenderMs: 0,
-  statusNote: "100% client-side · ready to arrange & synthesize",
+  statusNote: "Connect local fas.exe (ws://127.0.0.1:3003) for live 512-osc Fragment synthesis",
 
   mediaSeq: 0,
   clipSeq: 0,
-  mediaPool: new Map(), // mediaId -> { mediaId, filename, width, height, rgba, thumbUrl }
+  mediaPool: new Map(),
   mediaOrder: [],
-  clips: [],            // [{ clipId, mediaId, title, polarity, condMode, rmsDb }]
+  clips: [],
 
-  // Derived pre-synthesis caches
-  planes: [],           // Float32Array[] aligned to current clips
-  planeP: 0,
-  planeC: 0,
+  // Pre-synthesis aligned planes & canvases (synced 1:1 with FAS height `h`!)
+  planes: [],
+  planeP: 512,
+  planeC: 120,
   clipThumbUrls: [],
   clipCanvases: [],
+  clipDemodCanvases: [],
+  clipEventCanvases: [],
+  stitchedCanvas: null,
   seams: [],
   seamCanvases: [],
 
-  // Rendered master artifacts
+  // Optional offline WAV artifacts
   masterSpecCanvas: null,
-  stftRawFrames: [],    // Canvas[] sliced directly from synthesized WAV STFT
-  stftDemodFrames: [],  // Canvas[] with negative polarity un-flipped live
-  stftEventFrames: [],  // Canvas[] neuromorphic Event-Camera (+ON cyan / -OFF amber) diff
+  stftRawFrames: [],
+  stftDemodFrames: [],
+  stftEventFrames: [],
   masterWavUrl: null,
-  masterWavBytes: 0,
   audioBuffer: null,
 
-  // View / playback state
-  monMode: "seam",      // "clip" | "master" | "seam" | "video"
-  videoMode: "demod",   // "demod" | "raw" | "event"
-  activeBpm: 120,
+  // View & transport state
+  monMode: "timeline", // "timeline" | "clip" | "seam" | "video" | "master"
+  videoMode: "demod",  // "demod" | "raw" | "event"
   selectedClipIdx: 0,
   selectedSeamIdx: 0,
   dragPayload: null,
   loop: true,
   playing: false,
+  playEngine: "none",  // "fas" | "webaudio" | "none"
+  playOffset: 0,
+  playStartCtxTime: 0,
   audioCtx: null,
   gainNode: null,
   sourceNode: null,
-  playStartCtxTime: 0,
-  playOffset: 0,
 
   worker: null,
   jobSeq: 0,
-  rendering: false,
+  sliceScratch: new Uint8Array(512 * 4),
 };
 
-function setBusy(on, text = "Synthesizing…") {
-  app.rendering = on;
+// --- Fragment Audio Server (grz0zrg/fas) Client ---
+const fas = new FasClient({
+  onStatus: (connected, msg) => {
+    app.fasConnected = connected;
+    if (!connected) {
+      app.fasLoad = null;
+      app.fasLatencyMs = null;
+      if (app.playEngine === "fas") {
+        app.playing = false;
+        app.playEngine = "none";
+        $("btn-play").textContent = "Play";
+      }
+    }
+    app.statusNote = msg;
+    renderUI();
+  },
+  onTelemetry: ({ load, latencyMs }) => {
+    app.fasLoad = load;
+    app.fasLatencyMs = latencyMs;
+    $("fas-telemetry").textContent = `${load}% · ${latencyMs.toFixed(1)}ms`;
+  },
+  onError: (msg) => {
+    $("fas-led").className = "led led-err";
+    app.statusNote = msg;
+    $("hud-note").textContent = msg;
+  },
+});
+
+function setBusy(on, text = "Working…") {
   $("busy-badge").textContent = text;
   $("busy-badge").classList.toggle("hidden", !on);
 }
@@ -167,21 +219,39 @@ function addClip(mediaId, polarity = "pos", insertIndex = null) {
 function markDirty(note) {
   app.dirty = true;
   app.statusNote = note;
-  recomputePreSynth();
+  recomputeTimelinePlanes();
   renderUI();
 }
 
-// Instant pre-synthesis conditioning + clip previews + 4-state Endomorphic Seam Deltas
-function recomputePreSynth() {
+// Compute exact FAS-aligned [h, C] partial planes, stitched timeline canvas, and 4-state Seam Deltas
+function recomputeTimelinePlanes() {
+  // Align plane vertical rows `P` 1:1 with FAS oscillator bank height `h` and log frequency lattice!
+  const h = Number(app.fasCfg.h) || 512;
+  const oct = Number(app.fasCfg.octaves) || 10;
+  const baseF = Number(app.fasCfg.baseFreq) || 16.35;
+  const maxF = baseF * Math.pow(2, oct);
+
+  app.cfg.partials = h;
+  app.cfg.fMinHz = baseF;
+  app.cfg.fMaxHz = Math.min(22050, maxF);
+  app.cfg.freqScale = "log";
+  app.cfg.pps = Number(app.fasCfg.fps) || 60;
+
+  if (app.sliceScratch.length !== h * 4) {
+    app.sliceScratch = new Uint8Array(h * 4);
+  }
+
   const freqs = buildFreqGrid(app.cfg);
-  const bypassEq = Boolean(app.cfg.preserveBreathingContrast) && (app.breathingEnabled || hasNegativeClip());
+  const bypassEq = true;
 
   app.planes = [];
   app.clipCanvases = [];
+  app.clipDemodCanvases = [];
   app.clipThumbUrls = [];
-  app.planeP = freqs.length;
-  app.planeC = Math.max(8, Math.round((Number(app.cfg.slotDurationS) || 2.0) * (Number(app.cfg.pps) || 120.0)));
+  app.planeP = h;
+  app.planeC = Math.max(8, Math.round((Number(app.cfg.slotDurationS) || 2.0) * (Number(app.fasCfg.fps) || 60)));
 
+  const demodPlanes = [];
   for (const clip of app.clips) {
     const item = app.mediaPool.get(clip.mediaId);
     if (!item) continue;
@@ -197,10 +267,62 @@ function recomputePreSynth() {
     app.planeP = P;
     app.planeC = C;
     app.planes.push(plane);
+
     const greenRgba = renderPlaneGreenRGBA(plane, P, C);
     const cv = rgbaToCanvas(greenRgba, C, P);
     app.clipCanvases.push(cv);
     app.clipThumbUrls.push(cv.toDataURL("image/png"));
+
+    // Demodulated positive plane for clean live flipbook / Event-Cam view
+    const dem = new Float32Array(plane.length);
+    if (clip.polarity === "neg") {
+      for (let i = 0; i < plane.length; i++) dem[i] = 1.0 - plane[i];
+    } else {
+      dem.set(plane);
+    }
+    demodPlanes.push(dem);
+    app.clipDemodCanvases.push(rgbaToCanvas(renderPlaneGreenRGBA(dem, P, C), C, P));
+  }
+
+  // Build stitched timeline canvas (what streams live to FAS!)
+  if (app.clipCanvases.length > 0) {
+    const st = document.createElement("canvas");
+    st.width = app.planeC * app.clipCanvases.length;
+    st.height = app.planeP;
+    const sctx = st.getContext("2d");
+    app.clipCanvases.forEach((cv, i) => sctx.drawImage(cv, i * app.planeC, 0));
+    app.stitchedCanvas = st;
+  } else {
+    app.stitchedCanvas = null;
+  }
+
+  // Event-camera live diff frames & 4-state Endomorphic Seam Deltas
+  app.clipEventCanvases = [];
+  for (let k = 0; k < demodPlanes.length; k++) {
+    const prev = demodPlanes[(k - 1 + demodPlanes.length) % demodPlanes.length];
+    const curr = demodPlanes[k];
+    const evRgba = new Uint8ClampedArray(app.planeP * app.planeC * 4);
+    for (let r = 0; r < app.planeP; r++) {
+      const srcRow = (app.planeP - 1 - r) * app.planeC;
+      const dstRow = r * app.planeC;
+      for (let c = 0; c < app.planeC; c++) {
+        const d = curr[srcRow + c] - prev[srcRow + c];
+        const o = (dstRow + c) * 4;
+        if (d > 0.06) {
+          const m = Math.min(1, d / 0.7);
+          evRgba[o] = Math.round(m * 30);
+          evRgba[o + 1] = Math.round(m * 235);
+          evRgba[o + 2] = Math.round(m * 255);
+        } else if (d < -0.06) {
+          const m = Math.min(1, -d / 0.7);
+          evRgba[o] = Math.round(m * 255);
+          evRgba[o + 1] = Math.round(m * 110);
+          evRgba[o + 2] = Math.round(m * 30);
+        }
+        evRgba[o + 3] = 255;
+      }
+    }
+    app.clipEventCanvases.push(rgbaToCanvas(evRgba, app.planeC, app.planeP));
   }
 
   app.seams = [];
@@ -225,108 +347,163 @@ function recomputePreSynth() {
   if (app.selectedSeamIdx >= app.seams.length) app.selectedSeamIdx = Math.max(0, app.seams.length - 1);
 }
 
-// --- Web Worker Lossless Master Synthesis ---
-function ensureWorker() {
-  if (!app.worker) {
-    app.worker = new Worker("./js/synth_worker.js", { type: "module" });
+/**
+ * Extract 1-pixel-wide vertical RGBA slice for Fragment Audio Server at `timeSec`.
+ * FAS note.c expects pixel index 0 = lowest frequency (`baseFreq`), index h-1 = highest frequency!
+ * Our `planes[clipIdx]` is already bottom-anchored (row 0 = lowest Hz).
+ */
+function getFasSliceAt(timeSec) {
+  const n = app.planes.length;
+  if (n === 0) return null;
+  const dt = Number(app.cfg.slotDurationS) || 2.0;
+  const clipIdx = Math.min(n - 1, Math.max(0, Math.floor(timeSec / dt)));
+  const localFrac = Math.max(0, Math.min(0.999999, (timeSec - clipIdx * dt) / dt));
+  const col = Math.min(app.planeC - 1, Math.floor(localFrac * app.planeC));
+
+  const plane = app.planes[clipIdx];
+  const h = app.planeP;
+  const C = app.planeC;
+  const out = app.sliceScratch;
+  const isNeg = app.clips[clipIdx]?.polarity === "neg";
+  const breathLR = app.fasCfg.stereoMode === "breath_lr";
+
+  for (let r = 0; r < h; r++) {
+    const v = plane[r * C + col];
+    const amp = Math.min(255, Math.max(0, Math.round(v * 255)));
+    const o = r * 4;
+    if (breathLR) {
+      out[o] = isNeg ? Math.round(amp * 0.35) : amp;     // Left (R)
+      out[o + 1] = isNeg ? amp : Math.round(amp * 0.35); // Right (G)
+    } else {
+      out[o] = amp;     // Left (R)
+      out[o + 1] = amp; // Right (G)
+    }
+    out[o + 2] = 0;     // Blue (secondary synth param)
+    out[o + 3] = 255;   // Alpha
   }
+  return out;
+}
+
+// --- Playback Control (Primary: FAS Live 60fps | Fallback: Offline WebAudio WAV) ---
+function ensureAudio() {
+  if (!app.audioCtx) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    app.audioCtx = new AC();
+    app.gainNode = app.audioCtx.createGain();
+    app.gainNode.gain.value = parseFloat($("gain-input").value) || 0.12;
+    app.gainNode.connect(app.audioCtx.destination);
+  }
+  if (app.audioCtx.state === "suspended") app.audioCtx.resume();
+}
+
+function currentPlayheadSec() {
+  const dur = Math.max(0.001, totalDurationS());
+  if (!app.playing) return Math.max(0, Math.min(dur, app.playOffset));
+  if (app.playEngine === "fas") return Math.max(0, Math.min(dur, app.playOffset));
+  if (app.playEngine === "webaudio" && app.audioCtx) {
+    const pos = app.playOffset + (app.audioCtx.currentTime - app.playStartCtxTime);
+    return app.loop ? ((pos % dur) + dur) % dur : Math.min(dur, pos);
+  }
+  return app.playOffset;
+}
+
+function stopPlayback(keepOffset = true) {
+  if (keepOffset && app.playing) app.playOffset = currentPlayheadSec();
+  if (app.playEngine === "fas") {
+    fas.stopStream(true);
+  }
+  if (app.sourceNode) {
+    try { app.sourceNode.onended = null; app.sourceNode.stop(); } catch (_) {}
+    app.sourceNode.disconnect();
+    app.sourceNode = null;
+  }
+  app.playing = false;
+  app.playEngine = "none";
+  $("btn-play").textContent = "Play";
+}
+
+function startPlayback(offsetSec = null) {
+  if (app.clips.length === 0) return;
+  const dur = totalDurationS();
+  const off = offsetSec !== null ? Math.max(0, Math.min(dur - 0.001, offsetSec)) : (app.playOffset % dur);
+
+  // 1. Primary path: live stream straight to native C11 Fragment Audio Server!
+  if (app.fasConnected) {
+    stopPlayback(false);
+    app.playOffset = off;
+    app.playing = true;
+    app.playEngine = "fas";
+    $("btn-play").textContent = "Pause";
+    fas.startStream({
+      durationS: dur,
+      startOffsetS: off,
+      loop: app.loop,
+      getSliceAt: getFasSliceAt,
+      onTick: (pos) => { app.playOffset = pos; },
+      onEnded: () => {
+        app.playing = false;
+        app.playEngine = "none";
+        app.playOffset = 0;
+        $("btn-play").textContent = "Play";
+      },
+    });
+    return;
+  }
+
+  // 2. Fallback path: Offline Browser WAV if already synthesized
+  if (app.audioBuffer) {
+    ensureAudio();
+    stopPlayback(false);
+    const src = app.audioCtx.createBufferSource();
+    src.buffer = app.audioBuffer;
+    src.loop = app.loop;
+    src.connect(app.gainNode);
+    src.onended = () => {
+      if (!app.loop) {
+        app.playing = false;
+        app.playEngine = "none";
+        app.playOffset = 0;
+        $("btn-play").textContent = "Play";
+      }
+    };
+    src.start(0, off % (app.audioBuffer.duration || 1));
+    app.sourceNode = src;
+    app.playStartCtxTime = app.audioCtx.currentTime;
+    app.playOffset = off;
+    app.playing = true;
+    app.playEngine = "webaudio";
+    $("btn-play").textContent = "Pause";
+    return;
+  }
+
+  app.statusNote = "FAS not connected — click Connect FAS (start fas.exe) or click Offline WAV";
+  renderUI();
+}
+
+// --- Optional Offline Browser WAV Synthesis Fallback ---
+function ensureWorker() {
+  if (!app.worker) app.worker = new Worker("./js/synth_worker.js", { type: "module" });
   return app.worker;
 }
 
-function buildDecodedStftFrames(specRgba, specW, specH, frameW, numClips) {
-  const rawFrames = [];
-  const demodFrames = [];
-  const demodLuma = [];
-
-  for (let k = 0; k < numClips; k++) {
-    const x0 = k * frameW;
-    const rawArr = new Uint8ClampedArray(frameW * specH * 4);
-    const demArr = new Uint8ClampedArray(frameW * specH * 4);
-    const luma = new Float32Array(frameW * specH);
-    const isNeg = app.clips[k] && app.clips[k].polarity === "neg";
-
-    // Trim 4% edge margin inside each slot to reduce boundary fade dimness in flipbook view
-    let minG = 255, maxG = 0;
-    for (let y = 0; y < specH; y++) {
-      for (let x = 0; x < frameW; x++) {
-        const srcO = (y * specW + (x0 + x)) * 4;
-        const dstO = (y * frameW + x) * 4;
-        const r = specRgba[srcO], g = specRgba[srcO + 1], b = specRgba[srcO + 2];
-        rawArr[dstO] = r; rawArr[dstO + 1] = g; rawArr[dstO + 2] = b; rawArr[dstO + 3] = 255;
-        if (x >= 4 && x < frameW - 4) {
-          if (g < minG) minG = g;
-          if (g > maxG) maxG = g;
-        }
-      }
-    }
-
-    const span = Math.max(24, maxG - minG);
-    for (let y = 0; y < specH; y++) {
-      for (let x = 0; x < frameW; x++) {
-        const o = (y * frameW + x) * 4;
-        const gNorm = Math.min(1, Math.max(0, (rawArr[o + 1] - minG) / span));
-        // If negative polarity, invert carved-silence notch back into glowing bright shape
-        let v = isNeg ? Math.max(0, Math.min(1, 1.0 - gNorm)) : gNorm;
-        // Suppress dim boundary-fade edges on inverted frames so frame walls don't glow white
-        if (isNeg && (x < 5 || x >= frameW - 5)) v = 0;
-        luma[y * frameW + x] = v;
-        demArr[o] = Math.round(Math.pow(v, 2.2) * 180);
-        demArr[o + 1] = Math.round(v * 255);
-        demArr[o + 2] = Math.round(Math.pow(v, 1.8) * 140);
-        demArr[o + 3] = 255;
-      }
-    }
-
-    rawFrames.push(rgbaToCanvas(rawArr, frameW, specH));
-    demodFrames.push(rgbaToCanvas(demArr, frameW, specH));
-    demodLuma.push(luma);
-  }
-
-  // Neuromorphic Event-Camera (Δ +ON cyan / -OFF amber) between consecutive decoded STFT frames
-  const eventFrames = [];
-  for (let k = 0; k < numClips; k++) {
-    const prev = demodLuma[(k - 1 + numClips) % numClips];
-    const curr = demodLuma[k];
-    const evArr = new Uint8ClampedArray(frameW * specH * 4);
-    for (let i = 0; i < curr.length; i++) {
-      const d = curr[i] - prev[i];
-      const o = i * 4;
-      if (d > 0.08) {
-        const mag = Math.min(1, (d - 0.08) / 0.55);
-        evArr[o] = Math.round(mag * 35);
-        evArr[o + 1] = Math.round(mag * 235);
-        evArr[o + 2] = Math.round(mag * 255);
-      } else if (d < -0.08) {
-        const mag = Math.min(1, (-d - 0.08) / 0.55);
-        evArr[o] = Math.round(mag * 255);
-        evArr[o + 1] = Math.round(mag * 115);
-        evArr[o + 2] = Math.round(mag * 30);
-      }
-      evArr[o + 3] = 255;
-    }
-    eventFrames.push(rgbaToCanvas(evArr, frameW, specH));
-  }
-
-  app.stftRawFrames = rawFrames;
-  app.stftDemodFrames = demodFrames;
-  app.stftEventFrames = eventFrames;
-}
-
-function synthesizeMaster({ autoDownload = false, openVideoAndPlay = false } = {}) {
-  if (app.clips.length === 0) {
-    app.statusNote = "Add at least one clip to the timeline before synthesizing.";
-    renderUI();
-    return;
-  }
+function synthesizeOfflineWav({ autoDownload = false } = {}) {
+  if (app.clips.length === 0) return;
   stopPlayback(false);
-  recomputePreSynth();
+  recomputeTimelinePlanes();
 
   const worker = ensureWorker();
   const jobId = ++app.jobSeq;
-  setBusy(true, "Synthesizing Lossless WAV…");
+  setBusy(true, "Rendering Offline WAV…");
 
   const planesCopy = app.planes.map((pl) => new Float32Array(pl));
   const transfers = planesCopy.map((pl) => pl.buffer);
+  const offlineCfg = {
+    ...app.cfg,
+    sr: 48000,
+    bitDepth: 24,
+    fftSize: app.cfg.slotDurationS < 0.35 ? 1024 : 2048,
+    phaseMode: "schroeder",
+  };
 
   worker.onmessage = async (ev) => {
     const msg = ev.data;
@@ -337,7 +514,7 @@ function synthesizeMaster({ autoDownload = false, openVideoAndPlay = false } = {
     }
     if (msg.type === "error") {
       setBusy(false);
-      app.statusNote = `Synthesis error: ${msg.message}`;
+      app.statusNote = `Offline WAV error: ${msg.message}`;
       renderUI();
       return;
     }
@@ -345,104 +522,53 @@ function synthesizeMaster({ autoDownload = false, openVideoAndPlay = false } = {
       setBusy(false);
       app.lastRenderMs = msg.elapsedMs;
       app.clips.forEach((c, i) => { c.rmsDb = msg.slotRmsDb[i] ?? null; });
-
-      // Master WAV Blob URL
       if (app.masterWavUrl) URL.revokeObjectURL(app.masterWavUrl);
       const wavBlob = new Blob([msg.masterWavBuf], { type: "audio/wav" });
       app.masterWavUrl = URL.createObjectURL(wavBlob);
-      app.masterWavBytes = wavBlob.size;
-
-      // Master Spectrogram Canvas + Live Decoded STFT Video Frames
-      const specRgba = new Uint8ClampedArray(msg.specRgbaBuf);
-      app.masterSpecCanvas = rgbaToCanvas(specRgba, msg.specW, msg.specH);
-      buildDecodedStftFrames(specRgba, msg.specW, msg.specH, msg.frameW, msg.numClips);
-
-      // Decode browser playback AudioBuffer
+      app.masterSpecCanvas = rgbaToCanvas(new Uint8ClampedArray(msg.specRgbaBuf), msg.specW, msg.specH);
       try {
         ensureAudio();
         app.audioBuffer = await app.audioCtx.decodeAudioData(msg.playWavBuf.slice(0));
-      } catch (e) {
-        console.warn("WebAudio decode warning:", e);
+      } catch (_) {
         app.audioBuffer = null;
       }
-
       app.dirty = false;
       app.rendered = true;
-      app.monMode = openVideoAndPlay ? "video" : "master";
-      app.statusNote = `Lossless ${app.cfg.sr / 1000} kHz / ${app.cfg.bitDepth}-bit WAV ready (${(wavBlob.size / 1024).toFixed(0)} KB · ${msg.elapsedMs.toFixed(0)} ms)`;
+      app.statusNote = `Offline WAV ready (${(wavBlob.size / 1024).toFixed(0)} KB · ${msg.elapsedMs.toFixed(0)} ms)`;
       renderUI();
-
-      if (openVideoAndPlay) {
-        app.loop = true;
-        $("btn-loop").classList.add("active");
-        startPlayback(0);
-      }
-      if (autoDownload) {
-        $("btn-dl-wav").click();
-      }
+      if (autoDownload) $("btn-dl-wav").click();
     }
   };
 
-  worker.postMessage(
-    { jobId, planes: planesCopy, P: app.planeP, C: app.planeC, cfg: { ...app.cfg } },
-    transfers
-  );
+  worker.postMessage({ jobId, planes: planesCopy, P: app.planeP, C: app.planeC, cfg: offlineCfg }, transfers);
 }
 
-// --- WebAudio Playback ---
-function ensureAudio() {
-  if (!app.audioCtx) {
-    const AC = window.AudioContext || window.webkitAudioContext;
-    app.audioCtx = new AC();
-    app.gainNode = app.audioCtx.createGain();
-    app.gainNode.gain.value = parseFloat($("gain-input").value) || 0.35;
-    app.gainNode.connect(app.audioCtx.destination);
-  }
-  if (app.audioCtx.state === "suspended") app.audioCtx.resume();
+// --- Exports: Stitched Breathing PNG Strip + Seam Delta JSON ---
+function exportStitchedStripPng() {
+  if (!app.stitchedCanvas) return;
+  const a = document.createElement("a");
+  a.href = app.stitchedCanvas.toDataURL("image/png");
+  a.download = `spectral_timeline_strip_${app.clips.length}clips_${app.planeP}h.png`;
+  a.click();
 }
 
-function currentPlayheadSec() {
-  const dur = Math.max(0.001, totalDurationS());
-  if (!app.playing || !app.audioCtx) return Math.max(0, Math.min(dur, app.playOffset));
-  const elapsed = app.audioCtx.currentTime - app.playStartCtxTime;
-  const pos = app.playOffset + elapsed;
-  return app.loop ? ((pos % dur) + dur) % dur : Math.min(dur, pos);
-}
-
-function stopPlayback(keepOffset = true) {
-  if (keepOffset && app.playing) app.playOffset = currentPlayheadSec();
-  if (app.sourceNode) {
-    try { app.sourceNode.onended = null; app.sourceNode.stop(); } catch (_) {}
-    app.sourceNode.disconnect();
-    app.sourceNode = null;
-  }
-  app.playing = false;
-  $("btn-play").textContent = "Play";
-}
-
-function startPlayback(offsetSec = null) {
-  if (!app.audioBuffer) return;
-  ensureAudio();
-  stopPlayback(false);
-  const dur = app.audioBuffer.duration || 1;
-  const off = offsetSec !== null ? Math.max(0, Math.min(dur - 0.001, offsetSec)) : (app.playOffset % dur);
-  const src = app.audioCtx.createBufferSource();
-  src.buffer = app.audioBuffer;
-  src.loop = app.loop;
-  src.connect(app.gainNode);
-  src.onended = () => {
-    if (!app.loop) {
-      app.playing = false;
-      app.playOffset = 0;
-      $("btn-play").textContent = "Play";
-    }
+function downloadTimelineJSON() {
+  const payload = {
+    tool: "spectral-timeline-fas",
+    exportedAt: new Date().toISOString(),
+    fasConfig: app.fasCfg,
+    slotDurationS: app.cfg.slotDurationS,
+    breathingEnabled: app.breathingEnabled,
+    clips: app.clips.map((c, i) => ({ index: i, title: c.title, polarity: c.polarity, condMode: c.condMode })),
+    seams: app.seams,
   };
-  src.start(0, off);
-  app.sourceNode = src;
-  app.playStartCtxTime = app.audioCtx.currentTime;
-  app.playOffset = off;
-  app.playing = true;
-  $("btn-play").textContent = "Pause";
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "spectral_timeline_deltas.json";
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 // --- Monitor Canvas Render Loop ---
@@ -460,63 +586,50 @@ function drawLoop() {
   ctx.fillRect(0, 0, w, h);
 
   const dur = Math.max(0.001, totalDurationS());
+  const t = currentPlayheadSec();
+
   if (app.monMode === "video") {
     const frames = app.videoMode === "raw"
-      ? app.stftRawFrames
+      ? app.clipCanvases
       : app.videoMode === "event"
-        ? app.stftEventFrames
-        : app.stftDemodFrames;
-
-    if (frames.length > 0 && app.rendered) {
-      const t = currentPlayheadSec();
+        ? app.clipEventCanvases
+        : app.clipDemodCanvases;
+    if (frames.length > 0) {
       const idx = app.playing
         ? Math.min(frames.length - 1, Math.floor((t / dur) * frames.length))
         : Math.min(frames.length - 1, app.selectedClipIdx);
       const fr = frames[idx];
-      // Preserve clean 4:3 video monitor framing inside canvas
-      const targetAspect = 4 / 3;
       const padY = 44 * dpr;
-      const availH = Math.max(40, h - padY * 1.3);
-      const drawH = availH;
-      const drawW = Math.min(w - 24 * dpr, drawH * targetAspect);
+      const drawH = Math.max(40, h - padY * 1.3);
+      const drawW = Math.min(w - 24 * dpr, drawH * (4 / 3));
       const dx = Math.floor((w - drawW) / 2);
       const dy = Math.floor((h - drawH) / 2 + 8 * dpr);
 
       ctx.imageSmoothingEnabled = true;
       ctx.drawImage(fr, dx, dy, drawW, drawH);
-      ctx.strokeStyle = (app.clips[idx]?.polarity === "neg") ? "rgba(72, 201, 240, 0.55)" : "rgba(56, 212, 122, 0.55)";
+      ctx.strokeStyle = app.clips[idx]?.polarity === "neg" ? "rgba(72, 201, 240, 0.55)" : "rgba(56, 212, 122, 0.55)";
       ctx.lineWidth = Math.max(1.5, dpr);
       ctx.strokeRect(dx, dy, drawW, drawH);
 
-      // Thin BPM playhead scrub bar along bottom
-      const barH = 4 * dpr;
+      // Playhead bar
       ctx.fillStyle = "rgba(255,255,255,0.1)";
-      ctx.fillRect(dx, dy + drawH + 6 * dpr, drawW, barH);
+      ctx.fillRect(dx, dy + drawH + 6 * dpr, drawW, 4 * dpr);
       ctx.fillStyle = "#38d47a";
-      ctx.fillRect(dx, dy + drawH + 6 * dpr, drawW * (t / dur), barH);
+      ctx.fillRect(dx, dy + drawH + 6 * dpr, drawW * (t / dur), 4 * dpr);
 
       const polTag = app.clips[idx]?.polarity === "neg" ? "− NEG" : "+ POS";
       $("video-frame-badge").textContent = `Frame ${idx + 1}/${frames.length} · ${polTag} · ${app.clips[idx]?.title || ""}`;
       $("hud-time").textContent = `${t.toFixed(2)} / ${totalDurationS().toFixed(2)} s`;
-    } else {
-      ctx.fillStyle = "#5c677a";
-      ctx.font = `${13 * dpr}px ui-monospace, monospace`;
-      ctx.textAlign = "center";
-      ctx.fillText("Click Synthesize WAV (or Shape Morph → Generate & Play) to decode live STFT video", w / 2, h / 2);
-      $("video-frame-badge").textContent = "Not synthesized";
     }
     requestAnimationFrame(drawLoop);
     return;
   }
 
   let srcCanvas = null;
-  if (app.monMode === "master") {
-    srcCanvas = app.masterSpecCanvas;
-  } else if (app.monMode === "seam") {
-    srcCanvas = app.seamCanvases[app.selectedSeamIdx] || null;
-  } else {
-    srcCanvas = app.clipCanvases[app.selectedClipIdx] || null;
-  }
+  if (app.monMode === "timeline") srcCanvas = app.stitchedCanvas;
+  else if (app.monMode === "master") srcCanvas = app.masterSpecCanvas;
+  else if (app.monMode === "seam") srcCanvas = app.seamCanvases[app.selectedSeamIdx] || null;
+  else srcCanvas = app.clipCanvases[app.selectedClipIdx] || null;
 
   if (srcCanvas) {
     ctx.imageSmoothingEnabled = true;
@@ -525,12 +638,13 @@ function drawLoop() {
     ctx.fillStyle = "#5c677a";
     ctx.font = `${13 * dpr}px ui-monospace, monospace`;
     ctx.textAlign = "center";
-    ctx.fillText("Stage images in Media Bay → arrange Timeline → click Synthesize WAV", w / 2, h / 2);
+    ctx.fillText("Add clips to Timeline · Connect FAS (ws://127.0.0.1:3003) · Press Space to stream live", w / 2, h / 2);
   }
 
-  if (app.monMode === "master" && app.clips.length > 0) {
+  // Draw slot dividers & live FAS / WebAudio scanline on stitched views
+  if ((app.monMode === "timeline" || app.monMode === "master") && app.clips.length > 0) {
     const n = app.clips.length;
-    ctx.strokeStyle = "rgba(255, 255, 255, 0.14)";
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.16)";
     ctx.lineWidth = Math.max(1, dpr);
     for (let i = 1; i < n; i++) {
       const x = (i / n) * w;
@@ -539,18 +653,15 @@ function drawLoop() {
       ctx.lineTo(x, h);
       ctx.stroke();
     }
-    const t = currentPlayheadSec();
     const px = (t / dur) * w;
-    ctx.strokeStyle = "#38d47a";
+    ctx.strokeStyle = app.fasConnected ? "#ffd24c" : "#38d47a";
     ctx.lineWidth = 2 * dpr;
     ctx.beginPath();
     ctx.moveTo(px, 0);
     ctx.lineTo(px, h);
     ctx.stroke();
-    $("hud-time").textContent = `${t.toFixed(2)} / ${totalDurationS().toFixed(2)} s`;
-  } else {
-    $("hud-time").textContent = `0.00 / ${totalDurationS().toFixed(2)} s`;
   }
+  $("hud-time").textContent = `${t.toFixed(2)} / ${totalDurationS().toFixed(2)} s`;
 
   requestAnimationFrame(drawLoop);
 }
@@ -565,58 +676,50 @@ function clearTimelineDropHighlights() {
 
 // --- Full UI Render ---
 function renderUI() {
-  const pill = $("status-pill");
-  if (app.dirty) {
-    pill.textContent = app.rendered ? "UNSYNCED EDITS" : "PRE-SYNTH";
-    pill.className = "pill pill-dirty";
-  } else {
-    pill.textContent = `RENDERED (${app.lastRenderMs.toFixed(0)} ms)`;
-    pill.className = "pill pill-ok";
-  }
-  $("format-pill").textContent = `${app.cfg.sr / 1000} kHz / ${app.cfg.bitDepth}-bit`;
+  $("fas-led").className = app.fasConnected ? "led led-on" : "led led-off";
+  $("btn-fas-connect").textContent = app.fasConnected ? "Disconnect FAS" : "Connect FAS";
+  $("btn-fas-connect").classList.toggle("active", app.fasConnected);
+  if (!app.fasConnected) $("fas-telemetry").textContent = "";
+
   $("hud-note").textContent = app.statusNote;
+  const methodName = (FAS_SYNTH_METHODS.find((m) => m.id === app.fasCfg.method) || FAS_SYNTH_METHODS[0]).name;
+  $("engine-badge").textContent = app.fasConnected
+    ? `Engine: Fragment FAS LIVE (${app.fasCfg.h} oscs · ${methodName} · ${app.fasCfg.fps} fps)`
+    : app.audioBuffer
+      ? "Engine: Offline Browser WAV Ready (or click Connect FAS)"
+      : "Engine: FAS Offline — start fas.exe & click Connect FAS (or Offline WAV)";
 
   const dl = $("btn-dl-wav");
   dl.classList.toggle("hidden", !app.masterWavUrl);
-  if (app.masterWavUrl) {
-    dl.href = app.masterWavUrl;
-    dl.download = `spectral_timeline_${app.cfg.sr / 1000}k_${app.cfg.bitDepth}b.wav`;
-  }
+  if (app.masterWavUrl) dl.href = app.masterWavUrl;
 
-  const rmsVals = app.clips.map((c) => c.rmsDb).filter((v) => v !== null && v !== undefined);
-  $("breathing-rms-lbl").textContent = rmsVals.length
-    ? "Slot RMS (dB): " + app.clips.map((c, i) => `${i + 1}:${c.polarity === "neg" ? "−" : "+"}${c.rmsDb}`).join("  ")
-    : `Partials=${app.cfg.partials} · ${app.cfg.fMinHz}–${app.cfg.fMaxHz} Hz`;
+  $("breathing-rms-lbl").textContent = `${app.fasCfg.h} oscs · ${app.fasCfg.baseFreq} Hz × 2^${app.fasCfg.octaves} (${Math.round(app.fasCfg.baseFreq * Math.pow(2, app.fasCfg.octaves))} Hz)`;
 
   const bBtn = $("btn-breathing");
   bBtn.textContent = `Breathing (+/−): ${app.breathingEnabled ? "ON" : "OFF"}`;
   bBtn.classList.toggle("active", app.breathingEnabled);
 
-  // Monitor header & legend
   document.querySelectorAll(".mon-tab").forEach((b) => b.classList.toggle("active", b.dataset.mon === app.monMode));
   $("seam-legend").classList.toggle("hidden", app.monMode !== "seam");
   $("video-bar").classList.toggle("hidden", app.monMode !== "video");
   document.querySelectorAll(".vmode-btn").forEach((b) => b.classList.toggle("active", b.dataset.vmode === app.videoMode));
 
-  if (app.monMode === "video") {
+  if (app.monMode === "timeline") {
+    $("mon-info").textContent = `Stitched FAS Bank (${app.clips.length} clips · ${app.planeP} oscs × ${app.planeC * app.clips.length} cols) · Click canvas to scrub`;
+  } else if (app.monMode === "video") {
     const fps = (1 / Math.max(0.05, Number(app.cfg.slotDurationS) || 0.5)).toFixed(1);
-    $("mon-info").textContent = app.rendered
-      ? `Live STFT Video Decoded from WAV · ${fps} fps (${app.cfg.slotDurationS}s/slot) · Press Space to Play`
-      : "Synthesize WAV to decode & animate live from the audio spectrogram";
+    $("mon-info").textContent = `Live Flipbook (${fps} fps) · Synced to ${app.fasConnected ? "Fragment FAS" : "Timeline"} Playhead`;
   } else if (app.monMode === "master") {
-    $("mon-info").textContent = app.rendered
-      ? `Master ${app.cfg.sr / 1000}kHz/${app.cfg.bitDepth}b · ${app.cfg.fMinHz}–${app.cfg.fMaxHz} Hz${app.dirty ? " (STALE)" : ""}`
-      : "Not synthesized yet — click Synthesize WAV";
+    $("mon-info").textContent = app.rendered ? "Offline Browser WAV STFT Preview" : "Click Offline WAV to generate a browser WAV preview";
   } else if (app.monMode === "seam") {
     const sm = app.seams[app.selectedSeamIdx];
     $("mon-info").textContent = sm
       ? `Seam ${sm.seamIndex + 1}: ${sm.polarityTransition} · Disp R=${sm.dispersionRatio.toFixed(2)} · Flux |Δ|=${sm.rectifiedFlux.toFixed(3)} · Δf=${sm.centroidDeltaHz >= 0 ? "+" : ""}${sm.centroidDeltaHz} Hz`
-      : "Add at least 2 clips to inspect Seam Delta";
+      : "Add 2+ clips to inspect Seam Delta";
   } else {
     const clip = app.clips[app.selectedClipIdx];
-    const dt = Number(app.cfg.slotDurationS) || 2.0;
     $("mon-info").textContent = clip
-      ? `Slot ${app.selectedClipIdx + 1}: ${clip.title} · ${clip.polarity === "neg" ? "NEGATIVE (black on green)" : "POSITIVE (green on black)"} · ${(app.selectedClipIdx * dt).toFixed(1)}–${((app.selectedClipIdx + 1) * dt).toFixed(1)} s`
+      ? `Slot ${app.selectedClipIdx + 1}: ${clip.title} · ${clip.polarity === "neg" ? "NEGATIVE (black on green)" : "POSITIVE (green on black)"}`
       : "Drag images from Media Bay onto the Timeline";
   }
 
@@ -635,8 +738,8 @@ function renderUI() {
       <div class="media-meta">
         <div class="media-name mono" title="${m.filename}">${m.filename}</div>
         <div class="media-actions">
-          <button class="media-add-btn" data-pol="pos" title="Add Positive (+ green on black)">+ Add</button>
-          <button class="media-add-btn" data-pol="neg" title="Add Negative (− black on green)" style="color: var(--cyan)">− Add</button>
+          <button class="media-add-btn" data-pol="pos">+ Add</button>
+          <button class="media-add-btn" data-pol="neg" style="color: var(--cyan)">− Add</button>
         </div>
       </div>
     `;
@@ -645,14 +748,8 @@ function renderUI() {
       ev.dataTransfer.effectAllowed = "copy";
       ev.dataTransfer.setData("text/plain", `media:${m.mediaId}`);
     });
-    card.addEventListener("dragend", () => {
-      app.dragPayload = null;
-      clearTimelineDropHighlights();
-    });
-    card.querySelector(".media-del-btn").addEventListener("click", (ev) => {
-      ev.stopPropagation();
-      deleteMedia(m.mediaId);
-    });
+    card.addEventListener("dragend", () => { app.dragPayload = null; clearTimelineDropHighlights(); });
+    card.querySelector(".media-del-btn").addEventListener("click", (ev) => { ev.stopPropagation(); deleteMedia(m.mediaId); });
     card.querySelectorAll(".media-add-btn").forEach((btn) => {
       btn.addEventListener("click", (ev) => {
         ev.stopPropagation();
@@ -661,7 +758,6 @@ function renderUI() {
         addClip(m.mediaId, btn.dataset.pol, null);
         if (btn.dataset.pol === "pos") app.breathingEnabled = prevB;
         app.selectedClipIdx = app.clips.length - 1;
-        app.monMode = "clip";
         renderUI();
       });
     });
@@ -670,16 +766,16 @@ function renderUI() {
 
   // Timeline Strip
   const dt = Number(app.cfg.slotDurationS) || 2.0;
-  $("tl-summary").textContent = `${app.clips.length} / ${MAX_CLIPS} clips · ${totalDurationS().toFixed(1)} s`;
+  $("tl-summary").textContent = `${app.clips.length} / ${MAX_CLIPS} clips · ${totalDurationS().toFixed(2)} s`;
   const strip = $("timeline-strip");
   strip.innerHTML = "";
   app.clips.forEach((c, idx) => {
     const card = document.createElement("div");
-    card.className = `clip-card pol-${c.polarity}` + (idx === app.selectedClipIdx && app.monMode === "clip" ? " selected" : "");
+    card.className = `clip-card pol-${c.polarity}` + (idx === app.selectedClipIdx ? " selected" : "");
     card.draggable = true;
     card.innerHTML = `
       <div class="clip-top mono">
-        <span>#${String(idx + 1).padStart(2, "0")} · ${(idx * dt).toFixed(1)}s</span>
+        <span>#${String(idx + 1).padStart(2, "0")} · ${(idx * dt).toFixed(2)}s</span>
         <span>
           <button class="clip-mini" data-act="left" title="Move Left">◀</button>
           <button class="clip-mini" data-act="right" title="Move Right">▶</button>
@@ -690,30 +786,22 @@ function renderUI() {
       <img class="clip-thumb" src="${app.clipThumbUrls[idx] || ""}" alt="${c.title}" draggable="false" />
       <div class="clip-foot">
         <span class="clip-title mono" title="${c.title}">${c.title}</span>
-        <button class="pol-btn ${c.polarity}" data-act="pol" title="Toggle polarity">
-          ${c.polarity === "neg" ? "− NEG" : "+ POS"}
-        </button>
+        <button class="pol-btn ${c.polarity}" data-act="pol">${c.polarity === "neg" ? "− NEG" : "+ POS"}</button>
       </div>
     `;
     card.addEventListener("dragstart", (ev) => {
       app.dragPayload = { kind: "clip", fromIndex: idx };
       card.classList.add("dragging");
       ev.dataTransfer.effectAllowed = "move";
-      ev.dataTransfer.setData("text/plain", `clip:${idx}`);
     });
-    card.addEventListener("dragend", () => {
-      app.dragPayload = null;
-      card.classList.remove("dragging");
-      clearTimelineDropHighlights();
-    });
+    card.addEventListener("dragend", () => { app.dragPayload = null; card.classList.remove("dragging"); clearTimelineDropHighlights(); });
     card.addEventListener("dragover", (ev) => {
       if (!app.dragPayload) return;
       ev.preventDefault();
       ev.stopPropagation();
       const rect = card.getBoundingClientRect();
-      const before = (ev.clientX - rect.left) < rect.width / 2;
       clearTimelineDropHighlights();
-      card.classList.add(before ? "drop-before" : "drop-after");
+      card.classList.add((ev.clientX - rect.left) < rect.width / 2 ? "drop-before" : "drop-after");
     });
     card.addEventListener("drop", (ev) => {
       if (!app.dragPayload) return;
@@ -724,12 +812,10 @@ function renderUI() {
       const payload = app.dragPayload;
       app.dragPayload = null;
       clearTimelineDropHighlights();
-
       if (payload.kind === "media") {
         const insertIdx = before ? idx : idx + 1;
         addClip(payload.mediaId, ev.shiftKey ? "neg" : "pos", insertIdx);
         app.selectedClipIdx = insertIdx;
-        app.monMode = "clip";
         renderUI();
       } else if (payload.kind === "clip") {
         let toIdx = before ? idx : idx + 1;
@@ -746,13 +832,10 @@ function renderUI() {
     });
     card.addEventListener("click", () => {
       app.selectedClipIdx = idx;
-      if (app.monMode === "video" && app.rendered) {
-        const t = idx * (Number(app.cfg.slotDurationS) || 0.5);
-        app.playOffset = t;
-        if (app.playing) startPlayback(t);
-      } else {
-        app.monMode = "clip";
-      }
+      const tSeek = idx * dt;
+      app.playOffset = tSeek;
+      if (app.playing) startPlayback(tSeek);
+      if (app.monMode !== "video" && app.monMode !== "timeline") app.monMode = "clip";
       renderUI();
     });
     card.querySelectorAll("[data-act]").forEach((btn) => {
@@ -802,26 +885,25 @@ function renderUI() {
     }
   });
 
-  // Config controls
-  const presetSel = $("cfg-preset");
-  if (presetSel.options.length === 0) {
-    Object.keys(PRESETS).forEach((name) => {
+  // FAS controls sync
+  const mSel = $("fas-method");
+  if (mSel.options.length === 0) {
+    FAS_SYNTH_METHODS.forEach((m) => {
       const opt = document.createElement("option");
-      opt.value = name;
-      opt.textContent = name;
-      presetSel.appendChild(opt);
+      opt.value = String(m.id);
+      opt.textContent = m.name;
+      mSel.appendChild(opt);
     });
   }
-  presetSel.value = app.cfg.preset;
+  mSel.value = String(app.fasCfg.method);
+  $("fas-addr").value = app.fasCfg.address;
+  $("fas-height").value = String(app.fasCfg.h);
+  $("fas-octaves").value = String(app.fasCfg.octaves);
+  $("fas-basefreq").value = app.fasCfg.baseFreq;
+  $("fas-fps").value = String(app.fasCfg.fps);
+  $("fas-stereo").value = app.fasCfg.stereoMode;
   $("cfg-slot-s").value = app.cfg.slotDurationS;
-  $("cfg-fmin").value = app.cfg.fMinHz;
-  $("cfg-fmax").value = app.cfg.fMaxHz;
-  $("cfg-scale").value = app.cfg.freqScale;
-  $("cfg-partials").value = app.cfg.partials;
   $("cfg-cond").value = app.cfg.condMode;
-  $("cfg-sr").value = String(app.cfg.sr);
-  $("cfg-bit-depth").value = String(app.cfg.bitDepth);
-  $("cfg-preserve-breathing").checked = app.cfg.preserveBreathingContrast;
 
   // Seam Delta Table
   const wrap = $("seam-table-wrap");
@@ -864,7 +946,6 @@ function renderUI() {
   }
 }
 
-// --- Image File Import (100% client-side) ---
 async function importFiles(fileList) {
   for (const file of fileList) {
     const bmp = await createImageBitmap(file);
@@ -884,26 +965,52 @@ async function importFiles(fileList) {
   renderUI();
 }
 
-function downloadTimelineJSON() {
-  const payload = {
-    tool: "spectral-timeline",
-    exportedAt: new Date().toISOString(),
-    config: app.cfg,
-    breathingEnabled: app.breathingEnabled,
-    clips: app.clips.map((c, i) => ({ index: i, title: c.title, polarity: c.polarity, condMode: c.condMode, rmsDb: c.rmsDb })),
-    seams: app.seams,
-  };
-  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = "spectral_timeline_deltas.json";
-  a.click();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
+function syncFasConfigFromUI() {
+  app.fasCfg.h = parseInt($("fas-height").value, 10) || 512;
+  app.fasCfg.octaves = Math.max(2, Math.min(12, parseInt($("fas-octaves").value, 10) || 10));
+  app.fasCfg.baseFreq = Math.max(8, parseFloat($("fas-basefreq").value) || 16.35);
+  app.fasCfg.fps = parseInt($("fas-fps").value, 10) || 60;
+  app.fasCfg.method = parseInt($("fas-method").value, 10) || 0;
+  app.fasCfg.stereoMode = $("fas-stereo").value || "mono";
+  app.fasCfg.gain = parseFloat($("gain-input").value) || 0.12;
+  app.cfg.slotDurationS = Math.max(0.125, Math.min(10, parseFloat($("cfg-slot-s").value) || 2.0));
+  app.cfg.condMode = $("cfg-cond").value || "raw";
+  app.clips.forEach((c) => { c.condMode = app.cfg.condMode; });
+
+  fas.syncSettings(
+    { h: app.fasCfg.h, octaves: app.fasCfg.octaves, baseFreq: app.fasCfg.baseFreq, floatData: false },
+    { fps: app.fasCfg.fps, gain: app.fasCfg.gain, method: app.fasCfg.method }
+  );
+  markDirty(`Synced FAS bank (${app.fasCfg.h} oscs, ${app.fasCfg.octaves} oct, ${app.fasCfg.baseFreq} Hz)`);
 }
 
-// --- Event Wiring ---
 function bindEvents() {
+  // FAS connect / live synth method / gain
+  $("fas-addr").addEventListener("change", () => {
+    app.fasCfg.address = $("fas-addr").value.trim() || "127.0.0.1:3003";
+    localStorage.setItem("st-fas-addr", app.fasCfg.address);
+  });
+  $("btn-fas-connect").addEventListener("click", () => {
+    if (app.fasConnected) {
+      fas.disconnect();
+    } else {
+      app.fasCfg.address = $("fas-addr").value.trim() || "127.0.0.1:3003";
+      localStorage.setItem("st-fas-addr", app.fasCfg.address);
+      fas.bank = { h: app.fasCfg.h, octaves: app.fasCfg.octaves, baseFreq: app.fasCfg.baseFreq, floatData: false };
+      fas.synth = { fps: app.fasCfg.fps, gain: app.fasCfg.gain, method: app.fasCfg.method };
+      fas.connect(app.fasCfg.address);
+    }
+  });
+  $("fas-method").addEventListener("change", () => {
+    app.fasCfg.method = parseInt($("fas-method").value, 10) || 0;
+    fas.setSynthMethod(app.fasCfg.method);
+    renderUI();
+  });
+  $("fas-stereo").addEventListener("change", () => {
+    app.fasCfg.stereoMode = $("fas-stereo").value;
+  });
+  $("btn-apply-cfg").addEventListener("click", syncFasConfigFromUI);
+
   $("btn-import-media").addEventListener("click", () => $("file-media").click());
   $("file-media").addEventListener("change", (ev) => {
     if (ev.target.files.length) importFiles(ev.target.files);
@@ -911,11 +1018,7 @@ function bindEvents() {
   });
 
   const bay = $("media-bay");
-  bay.addEventListener("dragover", (ev) => {
-    if (app.dragPayload) return;
-    ev.preventDefault();
-    bay.classList.add("drag-over");
-  });
+  bay.addEventListener("dragover", (ev) => { if (!app.dragPayload) { ev.preventDefault(); bay.classList.add("drag-over"); } });
   bay.addEventListener("dragleave", () => bay.classList.remove("drag-over"));
   bay.addEventListener("drop", (ev) => {
     if (app.dragPayload) return;
@@ -925,15 +1028,8 @@ function bindEvents() {
   });
 
   const strip = $("timeline-strip");
-  strip.addEventListener("dragover", (ev) => {
-    if (!app.dragPayload) return;
-    ev.preventDefault();
-    clearTimelineDropHighlights();
-    strip.classList.add("drag-over");
-  });
-  strip.addEventListener("dragleave", (ev) => {
-    if (ev.target === strip) strip.classList.remove("drag-over");
-  });
+  strip.addEventListener("dragover", (ev) => { if (app.dragPayload) { ev.preventDefault(); clearTimelineDropHighlights(); strip.classList.add("drag-over"); } });
+  strip.addEventListener("dragleave", (ev) => { if (ev.target === strip) strip.classList.remove("drag-over"); });
   strip.addEventListener("drop", (ev) => {
     if (!app.dragPayload) return;
     ev.preventDefault();
@@ -943,7 +1039,6 @@ function bindEvents() {
     if (payload.kind === "media") {
       addClip(payload.mediaId, ev.shiftKey ? "neg" : "pos", null);
       app.selectedClipIdx = app.clips.length - 1;
-      app.monMode = "clip";
       renderUI();
     } else if (payload.kind === "clip" && app.clips.length > 1) {
       const lastIdx = app.clips.length - 1;
@@ -970,29 +1065,6 @@ function bindEvents() {
     markDirty("Cleared timeline");
   });
 
-  $("cfg-preset").addEventListener("change", () => {
-    const name = $("cfg-preset").value;
-    if (PRESETS[name]) {
-      app.cfg = { ...app.cfg, preset: name, ...PRESETS[name] };
-      app.clips.forEach((c) => { c.condMode = app.cfg.condMode; });
-      markDirty(`Loaded preset: ${name}`);
-    }
-  });
-
-  $("btn-apply-cfg").addEventListener("click", () => {
-    app.cfg.slotDurationS = Math.max(0.125, Math.min(10, parseFloat($("cfg-slot-s").value) || 2.0));
-    app.cfg.fMinHz = Math.max(20, parseFloat($("cfg-fmin").value) || 120);
-    app.cfg.fMaxHz = Math.max(app.cfg.fMinHz + 100, parseFloat($("cfg-fmax").value) || 18500);
-    app.cfg.freqScale = $("cfg-scale").value;
-    app.cfg.partials = Math.max(32, Math.min(516, parseInt($("cfg-partials").value, 10) || 320));
-    app.cfg.condMode = $("cfg-cond").value;
-    app.cfg.sr = parseInt($("cfg-sr").value, 10) || 48000;
-    app.cfg.bitDepth = parseInt($("cfg-bit-depth").value, 10) || 24;
-    app.cfg.preserveBreathingContrast = $("cfg-preserve-breathing").checked;
-    app.clips.forEach((c) => { c.condMode = app.cfg.condMode; });
-    markDirty("Updated synth settings (click Synthesize WAV)");
-  });
-
   function stageShapeMorphAnimation(andPlay = false) {
     const bpm = parseFloat($("anim-bpm").value) || 120;
     const beatsPerFrame = parseFloat($("anim-bpf").value) || 0.5;
@@ -1001,18 +1073,7 @@ function bindEvents() {
     const breathing = $("anim-breathing").checked;
 
     const seq = buildShapeMorphSequence({ bpm, beatsPerFrame, framesPerLeg, style, breathing });
-    app.activeBpm = seq.bpm;
     app.cfg.slotDurationS = seq.slotDurationS;
-    app.cfg.fftSize = seq.fftSize;
-    app.cfg.slotGapMs = seq.slotGapMs;
-    app.cfg.pps = seq.pps;
-    // Fast, super-crisp sonar/video band for responsive browser synthesis
-    app.cfg.fMinHz = 320;
-    app.cfg.fMaxHz = 7800;
-    app.cfg.partials = 160;
-    app.cfg.condMode = "raw";
-    app.cfg.freqScale = "linear";
-
     app.clips = [];
     app.breathingEnabled = false;
     for (const fr of seq.frames) {
@@ -1022,24 +1083,19 @@ function bindEvents() {
     app.breathingEnabled = breathing;
     app.selectedClipIdx = 0;
     app.selectedSeamIdx = 0;
-    app.monMode = andPlay ? "video" : "seam";
-    markDirty(
-      `Staged ${seq.frames.length}-frame Tri→Cir→Tri→Sq morph @ ${seq.bpm} BPM (${seq.slotDurationS}s/frame, ${(1 / seq.slotDurationS).toFixed(1)} fps)`
-    );
+    app.monMode = andPlay ? "video" : "timeline";
+    markDirty(`Staged ${seq.frames.length}-frame Tri→Cir→Tri→Sq morph @ ${seq.bpm} BPM (${seq.slotDurationS}s/frame)`);
     if (andPlay) {
-      synthesizeMaster({ autoDownload: false, openVideoAndPlay: true });
+      if (app.fasConnected) {
+        startPlayback(0);
+      } else {
+        synthesizeOfflineWav({ autoDownload: false });
+      }
     }
   }
 
   $("btn-gen-anim").addEventListener("click", () => stageShapeMorphAnimation(false));
   $("btn-gen-anim-play").addEventListener("click", () => stageShapeMorphAnimation(true));
-
-  document.querySelectorAll(".vmode-btn").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      app.videoMode = btn.dataset.vmode;
-      renderUI();
-    });
-  });
 
   $("btn-gen-secp").addEventListener("click", () => {
     try {
@@ -1057,7 +1113,7 @@ function bindEvents() {
       }
       app.breathingEnabled = true;
       app.selectedSeamIdx = 0;
-      app.monMode = app.clips.length >= 2 ? "seam" : "clip";
+      app.monMode = "timeline";
       markDirty(`Generated ${cards.length / 2} secp256k1 K / K·G breathing pair(s)`);
     } catch (err) {
       app.statusNote = `secp256k1 error: ${err.message}`;
@@ -1077,21 +1133,20 @@ function bindEvents() {
     if (pol === "neg") app.breathingEnabled = false;
     addClip(m.mediaId, pol, null);
     app.selectedClipIdx = app.clips.length - 1;
-    app.monMode = "clip";
     renderUI();
   });
 
-  $("btn-render").addEventListener("click", () => synthesizeMaster({ autoDownload: false }));
-  $("btn-export-wav2").addEventListener("click", () => synthesizeMaster({ autoDownload: true }));
+  $("btn-render").addEventListener("click", () => synthesizeOfflineWav({ autoDownload: false }));
+  $("btn-export-wav2").addEventListener("click", () => synthesizeOfflineWav({ autoDownload: true }));
+  $("btn-export-strip").addEventListener("click", exportStitchedStripPng);
   $("btn-export-json").addEventListener("click", downloadTimelineJSON);
 
   document.querySelectorAll(".mon-tab").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      app.monMode = btn.dataset.mon;
-      renderUI();
-    });
+    btn.addEventListener("click", () => { app.monMode = btn.dataset.mon; renderUI(); });
   });
-
+  document.querySelectorAll(".vmode-btn").forEach((btn) => {
+    btn.addEventListener("click", () => { app.videoMode = btn.dataset.vmode; renderUI(); });
+  });
   document.querySelectorAll(".dock-tab").forEach((btn) => {
     btn.addEventListener("click", () => {
       document.querySelectorAll(".dock-tab").forEach((b) => b.classList.toggle("active", b === btn));
@@ -1113,11 +1168,14 @@ function bindEvents() {
     if (app.sourceNode) app.sourceNode.loop = app.loop;
   });
   $("gain-input").addEventListener("input", () => {
-    if (app.gainNode) app.gainNode.gain.value = parseFloat($("gain-input").value) || 0.35;
+    const g = parseFloat($("gain-input").value) || 0.12;
+    app.fasCfg.gain = g;
+    fas.setGain(g);
+    if (app.gainNode) app.gainNode.gain.value = g;
   });
 
   canvas.addEventListener("click", (ev) => {
-    if (app.monMode !== "master" || !app.audioBuffer) return;
+    if (app.monMode !== "timeline" && app.monMode !== "master") return;
     const rect = canvas.getBoundingClientRect();
     const frac = Math.max(0, Math.min(1, (ev.clientX - rect.left) / Math.max(1, rect.width)));
     const t = frac * totalDurationS();
@@ -1135,7 +1193,6 @@ function bindEvents() {
 }
 
 function seedStarterMedia() {
-  // 1. Seed a crisp K=1 / K*G secp256k1 66-slot breathing pair right onto the timeline
   const { cards } = buildSecp256k1BreathingCards({ kRaw: "1", count: 1, alignMode: "66_header", bandMode: "full" });
   app.breathingEnabled = false;
   for (const card of cards) {
@@ -1144,16 +1201,14 @@ function seedStarterMedia() {
   }
   app.breathingEnabled = true;
 
-  // 2. Seed two extra Media Bay cards for quick drag-and-drop testing
   const textCard = renderUniformPixelBoxRGBA({ text: "RAMANUJAN CHIME 1729", cols: 10, bandMode: "rx11_lower" });
   addMediaFromRGBA("ramanujan_1729.png", textCard.rgba, textCard.width, textCard.height);
 
   const geo = renderGeometricTestRGBA(640, 360);
   addMediaFromRGBA("geometric_test.png", geo.rgba, geo.width, geo.height);
 
-  app.monMode = "seam";
-  app.selectedSeamIdx = 0;
-  markDirty("Seeded K=1 / K·G breathing pair + 2 Media Bay cards · click Synthesize WAV");
+  app.monMode = "timeline";
+  markDirty("Connect local fas.exe (ws://127.0.0.1:3003) & press Space to stream 512 native oscillators live");
 }
 
 bindEvents();

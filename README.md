@@ -1,19 +1,21 @@
-# Spectral Timeline
+# Spectral Timeline (Powered by Fragment Audio Server)
 
-A **100% browser-native, Resolve-style image-to-spectrogram additive synthesizer** designed for GitHub Pages (zero CLI, zero backend, zero build step).
+A **Resolve-style image-to-spectrogram timeline frontend** built for **GitHub Pages**, streaming real-time vertical RGBA slices directly to the native C11 **[Fragment Audio Server (`grz0zrg/fas`)](https://github.com/grz0zrg/fas)** over `ws://127.0.0.1:3003` — with Endomorphic `+ / −` Breathing polarity, `secp256k1` `K / K·G` uniform pixel-box cards, BPM-synced `Tri → Cir → Tri → Sq` morph animation, 4-state Seam Deltas, and one-click stitched PNG strip / offline WAV export.
 
-**Live App (GitHub Pages):** https://nextdayTre.github.io/spectral-timeline/
+**Live App (GitHub Pages):** https://nextdaytre.github.io/spectral-timeline/
 
 ---
 
-## Core Capabilities
+## Quick Start with Fragment Audio Server (`fas.exe`)
 
-* **Media Bay + Horizontal Timeline Strip:** Drag-and-drop `.png`/`.jpg` images into the Media Bay, drag cards straight onto the timeline (left/right half inserts before/after; hold `Shift` to drop as `− NEG`), and drag clips to reorder with **zero auto-synthesis lag**.
-* **Endomorphic Polarity (`+ / −`) & Breathing Cycle:** Toggle any clip between **`+ POS`** (bright green ink on silent black) and **`− NEG`** (carved silent black inside a bright green spectral bed), or enable **`Breathing (+/−)`** to alternate polarity automatically across the entire timeline with Schroeder minimum-crest phase.
-* **BPM-Synced Video-as-Audio Shape Morph (`Tri → Cir → Tri → Sq`):** Generates a smooth polar-SDF morph loop synced to musical BPM (`1/4` to `2` beats/frame) with alternating `+ / −` polarity, and decodes the synthesized WAV's real STFT spectrogram live in the **`Video-as-Audio (STFT)`** monitor in three modes: **`Demod (Unflip −)`**, **`Raw Breathing`**, and **`Event Cam (Δ +ON/−OFF)`** neuromorphic motion edges.
-* **Uniform Pixel-Box & `secp256k1` `K / K·G` Generator:** Pure-JS `BigInt` secp256k1 scalar multiplication + deterministic 5×7 monospace pixel-box renderer (`66_header` 3×22 alignment for `00+K` vs. `02/03+x`, `64_payload` 4×16 alignment, and `RX11 Lower Band` framing).
-* **Pre-Synthesis 4-State Endomorphic Seam Deltas:** Click any `Δ` seam chip between clips to inspect the color-coded 4-state transition map (`1→1 Carry`, `0→1 Ignite`, `1→0 Quench`, `0→0 Off`), Dispersion Ratio $R$, Signed/Rectified Flux (XNOR coincidence on inverted seams), and vertical $\Delta\text{Centroid}$ (Hz).
-* **Lossless Master WAV Export (Web Worker):** Renders `16-bit PCM`, `24-bit PCM`, or `32-bit IEEE Float` mono RIFF WAV at `44.1 / 48 / 96 kHz` off the main thread, ready to drop straight into iZotope RX11, plus WebAudio click-to-scrub playback and JSON delta manifest export.
+1. Download **`fas-2.0.2-x86_64-win.zip`** from https://github.com/grz0zrg/fas/releases/tag/v2.0.2 and extract into `fas_bin/` (or run `start_fas.bat` in your local clone).
+2. Start FAS:
+   ```cmd
+   start_fas.bat
+   ```
+   *(Optional: pass `--render my_recording` to record FAS's native audio output directly to disk.)*
+3. Open **https://nextdaytre.github.io/spectral-timeline/** and click **`Connect FAS`** in the top bar (works directly from HTTPS GitHub Pages to loopback `ws://127.0.0.1:3003`!).
+4. Arrange clips in the Media Bay / Timeline, toggle **`Breathing (+/−)`**, switch **`FAS Synth Method`** live (`Additive`, `Spectral afSTFT`, `FM`, `Subtractive`, `Formant`, `Modal`, `Wavetable`), and press **`Space`** to play!
 
 ---
 
@@ -21,23 +23,15 @@ A **100% browser-native, Resolve-style image-to-spectrogram additive synthesizer
 
 ```text
 spectral-timeline/
-├── index.html          # Main Resolve-style dark UI
-├── style.css           # Stylesheet (Media Bay, Monitor, Timeline Strip, Dock)
+├── index.html          # Main Resolve-style dark UI with FAS top bar & live telemetry
+├── style.css           # Stylesheet
+├── start_fas.bat       # One-click local launcher for Fragment Audio Server (fas.exe)
 ├── js/
-│   ├── glyph_grid.js   # Pure-JS BigInt secp256k1 + 5x7 uniform pixel-box renderer
-│   ├── dsp.js          # Conditioning, +/− polarity, 4-state deltas, Schroeder additive synth, STFT, WAV encoder
-│   ├── synth_worker.js # Non-blocking Web Worker for synthesis + STFT + WAV encoding
-│   └── app.js          # UI controller (drag-and-drop, WebAudio playback, exports)
-├── test_node.mjs       # Zero-dependency Node verification suite (`node test_node.mjs`)
+│   ├── fas_client.js   # Exact grz0zrg/fas v2.0.2 binary WebSocket protocol client & 60fps slicer
+│   ├── glyph_grid.js   # Pure-JS BigInt secp256k1 + 5x7 uniform pixel-box + Polar-SDF shape morph
+│   ├── dsp.js          # Conditioning, +/− polarity, 4-state Seam Deltas, & optional offline WAV fallback
+│   ├── synth_worker.js # Optional offline WAV Web Worker
+│   └── app.js          # Resolve-style UI controller & live FAS streamer
+├── test_node.mjs       # Zero-dep Node test suite (`node test_node.mjs`)
 └── .nojekyll           # Direct static serving on GitHub Pages
-```
-
-## Local Testing (Optional)
-
-```bash
-node test_node.mjs
-```
-To test locally over HTTP (needed for ES module Web Workers):
-```bash
-python -m http.server 8080
 ```
