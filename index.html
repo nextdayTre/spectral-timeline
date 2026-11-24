@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Spectral Timeline — Browser Image-to-Spectrogram Synthesizer</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <div class="shell">
+    <!-- TOP BAR -->
+    <header class="topbar">
+      <div class="tb-left">
+        <span class="brand">SPECTRAL TIMELINE</span>
+        <span id="status-pill" class="pill pill-dirty">PRE-SYNTH</span>
+        <span id="format-pill" class="pill mono">48 kHz / 24-bit</span>
+      </div>
+      <div class="tb-center mono">
+        <span id="hud-time">0.00 / 4.00 s</span>
+        <span class="sep">|</span>
+        <span id="hud-note" class="muted">100% browser-native · stage media and click Synthesize WAV</span>
+      </div>
+      <div class="tb-right">
+        <label class="gain-wrap mono">
+          Gain
+          <input id="gain-input" type="number" min="0" max="1" step="0.05" value="0.35" />
+        </label>
+        <button id="btn-render" class="btn btn-primary">Synthesize WAV</button>
+        <a id="btn-dl-wav" class="btn hidden" download="spectral_timeline.wav">Download WAV</a>
+      </div>
+    </header>
+
+    <!-- UPPER WORKSPACE: MEDIA BAY (LEFT) + MONITOR (CENTER) -->
+    <section class="upper">
+      <aside id="media-bay" class="media-bay">
+        <div class="panel-hdr">
+          <span>MEDIA BAY</span>
+          <button id="btn-import-media" class="mini-btn">+ Import Images</button>
+        </div>
+        <div class="drop-hint">
+          Drop .png/.jpg here · Drag cards onto Timeline (Shift = − NEG)
+        </div>
+        <div id="media-grid" class="media-grid"></div>
+      </aside>
+
+      <main class="monitor">
+        <div class="panel-hdr">
+          <div class="mon-tabs">
+            <button class="mon-tab active" data-mon="clip">Clip Preview</button>
+            <button class="mon-tab" data-mon="master">Master Spectrogram</button>
+            <button class="mon-tab" data-mon="seam">Seam Delta (4-State)</button>
+          </div>
+          <div class="mon-info mono muted" id="mon-info">Select a clip or click Synthesize WAV</div>
+        </div>
+
+        <div class="canvas-wrap">
+          <canvas id="monitor-canvas"></canvas>
+          <div id="seam-legend" class="seam-legend hidden mono">
+            <span class="leg-item"><i class="sw sw-11"></i>1→1 Carry</span>
+            <span class="leg-item"><i class="sw sw-01"></i>0→1 Ignite</span>
+            <span class="leg-item"><i class="sw sw-10"></i>1→0 Quench</span>
+            <span class="leg-item"><i class="sw sw-00"></i>0→0 Off</span>
+          </div>
+          <div id="busy-badge" class="busy-badge hidden mono">Synthesizing…</div>
+        </div>
+
+        <div class="transport">
+          <button id="btn-rewind" class="mini-btn" title="Rewind">|&lt;</button>
+          <button id="btn-play" class="mini-btn" title="Play / Pause (Space)">Play</button>
+          <button id="btn-loop" class="mini-btn active" title="Loop">Loop</button>
+          <span class="sep">|</span>
+          <span class="mono muted">Browser WebAudio · 100% Client-Side</span>
+          <span class="spacer"></span>
+          <span id="breathing-rms-lbl" class="mono muted"></span>
+        </div>
+      </main>
+    </section>
+
+    <!-- HORIZONTAL TIMELINE STRIP -->
+    <section class="timeline-section">
+      <div class="panel-hdr timeline-hdr">
+        <div class="tl-left">
+          <span>TIMELINE</span>
+          <span id="tl-summary" class="mono muted">0 clips · 0.0 s</span>
+        </div>
+        <div class="tl-actions">
+          <button id="btn-breathing" class="mini-btn active" title="Auto-alternate + (green on black) and - (black on green)">
+            Breathing (+/−): ON
+          </button>
+          <button id="btn-clear-tl" class="mini-btn">Clear</button>
+        </div>
+      </div>
+      <div id="timeline-strip" class="timeline-strip"></div>
+    </section>
+
+    <!-- BOTTOM DOCK -->
+    <footer class="dock">
+      <div class="dock-tabs">
+        <button class="dock-tab active" data-dock="synth">Synth &amp; Breathing</button>
+        <button class="dock-tab" data-dock="cards">Hex / K·G Cards</button>
+        <button class="dock-tab" data-dock="deltas">Endomorphic Deltas</button>
+        <button class="dock-tab" data-dock="deliver">Export / Manifest</button>
+      </div>
+
+      <div id="dock-synth" class="dock-panel active">
+        <div class="ctrl-row">
+          <label>Preset
+            <select id="cfg-preset"></select>
+          </label>
+          <label>Slot ΔT (s)
+            <input id="cfg-slot-s" type="number" min="0.5" max="10" step="0.5" />
+          </label>
+          <label>Min Hz
+            <input id="cfg-fmin" type="number" step="10" />
+          </label>
+          <label>Max Hz
+            <input id="cfg-fmax" type="number" step="100" />
+          </label>
+          <label>Scale
+            <select id="cfg-scale">
+              <option value="linear">linear</option>
+              <option value="log">log</option>
+            </select>
+          </label>
+          <label>Partials
+            <input id="cfg-partials" type="number" min="32" max="516" step="8" />
+          </label>
+          <label>Mode
+            <select id="cfg-cond">
+              <option value="raw">raw</option>
+              <option value="stroke">stroke</option>
+            </select>
+          </label>
+          <label>Sample Rate
+            <select id="cfg-sr">
+              <option value="44100">44.1 kHz</option>
+              <option value="48000">48 kHz</option>
+              <option value="96000">96 kHz</option>
+            </select>
+          </label>
+          <label>WAV Depth
+            <select id="cfg-bit-depth">
+              <option value="16">16-bit PCM</option>
+              <option value="24">24-bit PCM</option>
+              <option value="32">32-bit Float</option>
+            </select>
+          </label>
+          <label class="chk-label" title="Bypass per-column RMS equalization when inverted clips are present">
+            <input id="cfg-preserve-breathing" type="checkbox" checked />
+            Preserve Breathing Contrast
+          </label>
+          <button id="btn-apply-cfg" class="mini-btn">Apply</button>
+        </div>
+      </div>
+
+      <div id="dock-cards" class="dock-panel">
+        <div class="cards-split">
+          <div class="card-gen-box">
+            <div class="gen-title">secp256k1 K (+ POS) / K·G (− NEG) Uniform Pixel-Box Breathing Pair</div>
+            <div class="ctrl-row">
+              <label>Scalar K (dec or hex)
+                <input id="secp-k" type="text" class="mono wide-input" value="1" placeholder="1 or 0x..." />
+              </label>
+              <label>Pairs
+                <input id="secp-count" type="number" min="1" max="16" value="2" />
+              </label>
+              <label>Alignment
+                <select id="secp-align">
+                  <option value="66_header">66 slots (3×22: 00+K vs 02/03+x)</option>
+                  <option value="64_payload">64 slots (4×16: K vs x)</option>
+                </select>
+              </label>
+              <label>Freq Band
+                <select id="secp-band">
+                  <option value="full">Full Canvas</option>
+                  <option value="rx11_lower">RX11 Lower Band</option>
+                </select>
+              </label>
+              <label class="chk-label">
+                <input id="secp-replace" type="checkbox" checked />
+                Replace Timeline
+              </label>
+              <button id="btn-gen-secp" class="btn btn-primary">Generate K / K·G</button>
+            </div>
+          </div>
+
+          <div class="card-gen-box">
+            <div class="gen-title">Custom Uniform Pixel-Box Text / Hex Card</div>
+            <div class="ctrl-row">
+              <label>Text / Hex Payload
+                <input id="txt-payload" type="text" class="mono wide-input" value="RAMANUJAN CHIME 1729" />
+              </label>
+              <label>Cols/Row
+                <input id="txt-cols" type="number" min="4" max="66" placeholder="auto" />
+              </label>
+              <label>Polarity
+                <select id="txt-pol">
+                  <option value="pos">+ POS (green/black)</option>
+                  <option value="neg">− NEG (black/green)</option>
+                </select>
+              </label>
+              <label>Band
+                <select id="txt-band">
+                  <option value="full">Full Canvas</option>
+                  <option value="rx11_lower">RX11 Lower Band</option>
+                </select>
+              </label>
+              <button id="btn-gen-text" class="btn">Add Card</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="dock-deltas" class="dock-panel">
+        <div id="seam-table-wrap" class="seam-table-wrap mono"></div>
+      </div>
+
+      <div id="dock-deliver" class="dock-panel">
+        <div class="deliver-row">
+          <button id="btn-export-wav2" class="btn btn-primary">Synthesize &amp; Download Lossless WAV</button>
+          <button id="btn-export-json" class="btn">Download Seam Delta &amp; Timeline JSON</button>
+          <span class="mono muted" id="deliver-note">Outputs pure RIFF WAV (16/24-bit PCM or 32-bit float) ready for iZotope RX11.</span>
+        </div>
+      </div>
+    </footer>
+
+    <input id="file-media" type="file" accept="image/png,image/jpeg,image/webp" multiple class="hidden" />
+  </div>
+
+  <script type="module" src="./js/app.js"></script>
+</body>
+</html>
