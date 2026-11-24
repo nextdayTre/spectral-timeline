@@ -177,6 +177,109 @@ export function rgbaToConditionedPlane(rgba, srcW, srcH, cfg, polarity = "pos", 
   return { plane, P, C };
 }
 
+/**
+ * Extract normalized color warmth/saturation [P, C] (bottom-anchored) for FAS Blue-channel timbre routing.
+ * Warm gold/yellow/pink (R > B) -> high (0.75..1.0); cool cyan/blue (B > R) -> low (0.05..0.35).
+ */
+export function rgbaToChromaWarmthPlane(rgba, srcW, srcH, P, C) {
+  const out = new Float32Array(P * C);
+  const scaleX = srcW / C;
+  const scaleY = srcH / P;
+  for (let r = 0; r < P; r++) {
+    const sy = Math.min(srcH - 1, Math.max(0, ((P - 1 - r) + 0.5) * scaleY - 0.5)) | 0;
+    const dstOff = r * C;
+    for (let c = 0; c < C; c++) {
+      const sx = Math.min(srcW - 1, Math.max(0, (c + 0.5) * scaleX - 0.5)) | 0;
+      const o = (sy * srcW + sx) * 4;
+      const R = rgba[o] / 255.0;
+      const G = rgba[o + 1] / 255.0;
+      const B = rgba[o + 2] / 255.0;
+      const maxC = Math.max(R, G, B);
+      const minC = Math.min(R, G, B);
+      const sat = maxC > 1e-4 ? (maxC - minC) / maxC : 0.0;
+      // Warmth centered at 0.5, pulled toward 1.0 for gold/red/pink and 0.0 for cyan/blue
+      const warmth = 0.5 + 0.5 * (R - B);
+      out[dstOff + c] = Math.min(1.0, Math.max(0.0, warmth * (0.25 + 0.75 * sat)));
+    }
+  }
+  return out;
+}
+
+/**
+ * Compute neuromorphic Event-Camera (+ON / -OFF) planes across a sequence of positive-demodulated
+ * [P, C] frames, with optional exponential phosphor persistence trail (0.0..0.85).
+ * Returns { onPlanes, offPlanes, mixPlanes, frameMotionScores }.
+ */
+export function computeEventCameraSequence(demodPlanes, P, C, { threshold = 0.05, gain = 1.65, decay = 0.45 } = {}) {
+  const N = demodPlanes.length;
+  const onPlanes = [];
+  const offPlanes = [];
+  const mixPlanes = [];
+  const frameMotionScores = [];
+  if (N === 0) return { onPlanes, offPlanes, mixPlanes, frameMotionScores };
+
+  const len = P * C;
+  const thr = Math.max(0.0, Number(threshold) || 0.05);
+  const g = Math.max(0.5, Number(gain) || 1.65);
+  const dec = Math.max(0.0, Math.min(0.88, Number(decay) || 0.0));
+
+  let trailOn = new Float32Array(len);
+  let trailOff = new Float32Array(len);
+
+  for (let k = 0; k < N; k++) {
+    const prev = k === 0 ? demodPlanes[N - 1] : demodPlanes[k - 1];
+    const curr = demodPlanes[k];
+    const pOn = new Float32Array(len);
+    const pOff = new Float32Array(len);
+    const pMix = new Float32Array(len);
+
+    let sumDelta = 0;
+    for (let i = 0; i < len; i++) {
+      const d = curr[i] - prev[i];
+      sumDelta += Math.abs(d);
+      const rawOn = d > thr ? Math.min(1.0, (d - thr) * g) : 0.0;
+      const rawOff = d < -thr ? Math.min(1.0, (-d - thr) * g) : 0.0;
+
+      const vOn = Math.max(rawOn, trailOn[i] * dec);
+      const vOff = Math.max(rawOff, trailOff[i] * dec);
+      trailOn[i] = vOn;
+      trailOff[i] = vOff;
+
+      pOn[i] = vOn;
+      pOff[i] = vOff;
+      pMix[i] = Math.min(1.0, Math.max(vOn, vOff));
+    }
+
+    onPlanes.push(pOn);
+    offPlanes.push(pOff);
+    mixPlanes.push(pMix);
+    frameMotionScores.push(Number((sumDelta / Math.max(1, len)).toFixed(4)));
+  }
+
+  return { onPlanes, offPlanes, mixPlanes, frameMotionScores };
+}
+
+/**
+ * Render an Event-Camera (+ON cyan / -OFF amber) RGBA image from precomputed on/off planes.
+ */
+export function renderEventOnOffRGBA(onPlane, offPlane, P, C) {
+  const rgba = new Uint8ClampedArray(P * C * 4);
+  for (let r = 0; r < P; r++) {
+    const srcRow = (P - 1 - r) * C;
+    const dstRow = r * C;
+    for (let c = 0; c < C; c++) {
+      const vOn = onPlane[srcRow + c];
+      const vOff = offPlane[srcRow + c];
+      const o = (dstRow + c) * 4;
+      rgba[o] = Math.min(255, Math.round(vOff * 255 + vOn * 28));
+      rgba[o + 1] = Math.min(255, Math.round(vOn * 238 + vOff * 112));
+      rgba[o + 2] = Math.min(255, Math.round(vOn * 255 + vOff * 26));
+      rgba[o + 3] = 255;
+    }
+  }
+  return rgba;
+}
+
 function boxBlur2D(src, H, W, radius) {
   const tmp = new Float32Array(H * W);
   const out = new Float32Array(H * W);

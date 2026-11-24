@@ -381,6 +381,13 @@ html, body {
   padding: 0 6px;
   border-left: 1px solid var(--border);
 }
+.vsep { color: var(--border); margin: 0 2px; }
+.clip-thumb.inv-css { filter: invert(1) hue-rotate(180deg); }
+.seam-chip.cut-peak { border-color: var(--amber); color: var(--amber); background: rgba(245, 166, 35, 0.14); }
+.ctrl-row select#seq-synth-src { width: 200px; }
+.ctrl-row select#seq-fps { width: 138px; }
+.ctrl-row select#seq-stride,
+.ctrl-row select#seq-trail { width: 118px; }
 .ctrl-row select#anim-bpf,
 .ctrl-row select#anim-style { width: 175px; }
 .ctrl-row select#anim-fpl { width: 125px; }

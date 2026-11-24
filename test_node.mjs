@@ -22,11 +22,14 @@ import {
 } from "./js/glyph_grid.js";
 import {
   buildFreqGrid,
+  computeEventCameraSequence,
   computeSeamDelta,
   defaultConfig,
   encodeWavMono,
+  renderEventOnOffRGBA,
   renderStftSpectrogramRGBA,
   renderTimelineAudio,
+  rgbaToChromaWarmthPlane,
   rgbaToConditionedPlane,
 } from "./js/dsp.js";
 
@@ -219,6 +222,41 @@ import {
   const tel = parseStreamInfosPacket(telBuf);
   assert.deepEqual(tel, { load: 27, latencyMs: 4.25 });
   console.log("[PASS] Fragment Audio Server (grz0zrg/fas) binary protocol packets (IDs 0,1,2,3,5,6 + telemetry)");
+}
+
+// 7. Event-Camera Motion + Phosphor Decay Trail + Chromatic Warmth (Gold Aura vs Cyan Spirit Bomb)
+{
+  const P = 16, C = 16;
+  const f0 = new Float32Array(P * C);
+  const f1 = new Float32Array(P * C);
+  const f2 = new Float32Array(P * C);
+  // Static pixel (must drop to 0 in Event-Cam!) + moving pixel + hard cut
+  f0[0] = 0.8; f1[0] = 0.8; f2[0] = 0.8; // static background
+  f0[5] = 1.0; f1[6] = 1.0;              // moves from idx 5 -> 6 (-OFF at 5, +ON at 6)
+  f2.fill(0.95); f2[0] = 0.8;            // hard scene cut on frame 2
+
+  const ev = computeEventCameraSequence([f0, f1, f2], P, C, { threshold: 0.05, gain: 1.5, decay: 0.5 });
+  assert.equal(ev.onPlanes[1][0], 0, "Static pixel must be silent in Event-Cam +ON");
+  assert.equal(ev.offPlanes[1][0], 0, "Static pixel must be silent in Event-Cam -OFF");
+  assert.ok(ev.onPlanes[1][6] > 0.9, "Advancing edge must fire +ON");
+  assert.ok(ev.offPlanes[1][5] > 0.9, "Receding edge must fire -OFF");
+  assert.ok(ev.offPlanes[2][5] > 0.4, "Phosphor decay trail must persist on frame 2");
+  assert.ok(ev.frameMotionScores[2] > ev.frameMotionScores[1] * 5, "Scene cut must produce peak motion spike");
+
+  const evRgba = renderEventOnOffRGBA(ev.onPlanes[1], ev.offPlanes[1], P, C);
+  assert.equal(evRgba.length, P * C * 4);
+
+  // Chroma warmth: electric yellow/gold (255, 220, 30) vs cyan (40, 220, 255)
+  const goldRgba = new Uint8ClampedArray(4 * 4 * 4);
+  const cyanRgba = new Uint8ClampedArray(4 * 4 * 4);
+  for (let i = 0; i < goldRgba.length; i += 4) {
+    goldRgba[i] = 255; goldRgba[i + 1] = 220; goldRgba[i + 2] = 30; goldRgba[i + 3] = 255;
+    cyanRgba[i] = 40;  cyanRgba[i + 1] = 220; cyanRgba[i + 2] = 255; cyanRgba[i + 3] = 255;
+  }
+  const wGold = rgbaToChromaWarmthPlane(goldRgba, 4, 4, 4, 4)[0];
+  const wCyan = rgbaToChromaWarmthPlane(cyanRgba, 4, 4, 4, 4)[0];
+  assert.ok(wGold > 0.8 && wCyan < 0.25, `Expected gold (${wGold}) >> cyan (${wCyan})`);
+  console.log(`[PASS] Event-Cam (+ON/-OFF + phosphor trail + scene cut) & Chroma warmth (gold=${wGold.toFixed(2)} vs cyan=${wCyan.toFixed(2)})`);
 }
 
 console.log("\nALL SPECTRAL TIMELINE BROWSER-ENGINE SELF-TESTS PASSED.");

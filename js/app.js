@@ -1,13 +1,15 @@
-// Spectral Timeline — Resolve-Style Timeline + Fragment Audio Server (grz0zrg/fas) Backend
-// Primary engine: Real-time C11 Fragment Audio Server (ws://127.0.0.1:3003, 512+ oscillators @ 60fps).
-// Fallback / export: Stitched PNG Strip exporter + optional Offline Browser WAV Worker.
+// Spectral Timeline — Resolve-Style Timeline + Fragment Audio Server (grz0zrg/fas)
+// + Flipbook Image Sequence (up to 256 frames) & True Neuromorphic Event-Camera Audio Engine.
 
 import {
   buildFreqGrid,
+  computeEventCameraSequence,
   computeSeamDelta,
   defaultConfig,
+  renderEventOnOffRGBA,
   renderPlaneGreenRGBA,
   renderSeamDeltaRGBA,
+  rgbaToChromaWarmthPlane,
   rgbaToConditionedPlane,
 } from "./dsp.js";
 import { FAS_SYNTH_METHODS, FasClient } from "./fas_client.js";
@@ -18,7 +20,9 @@ import {
   renderUniformPixelBoxRGBA,
 } from "./glyph_grid.js";
 
-const MAX_CLIPS = 64;
+const MAX_CLIPS = 256;
+const HI_RES_W = 240;
+const HI_RES_H = 135;
 const $ = (id) => document.getElementById(id);
 const canvas = $("monitor-canvas");
 const ctx = canvas.getContext("2d");
@@ -32,7 +36,7 @@ function rgbaToCanvas(rgba, w, h) {
   return c;
 }
 
-function makeThumbDataUrl(rgba, w, h, tw = 240, th = 135) {
+function makeThumbDataUrl(rgba, w, h, tw = 192, th = 108) {
   const src = rgbaToCanvas(rgba, w, h);
   const dst = document.createElement("canvas");
   dst.width = tw;
@@ -56,14 +60,23 @@ const app = {
     baseFreq: 16.35,
     fps: 60,
     gain: 0.12,
-    method: 0, // 0 = FAS_ADDITIVE
-    stereoMode: "mono", // "mono" | "breath_lr"
+    method: 0,
+    stereoMode: "mono",
   },
   fasConnected: false,
   fasLoad: null,
   fasLatencyMs: null,
 
-  // Timeline & conditioning config
+  // Flipbook & Event-Camera Audio Settings
+  flipbook: {
+    synthSource: "full",   // "full" | "event" | "hybrid"
+    trailDecay: 0.45,      // phosphor persistence 0.0 .. 0.72
+    chromaBlue: true,      // route warm/cool pixel color -> FAS Blue timbre param
+    hiResMode: true,       // true = crisp 16:9 240x135 flipbook, false = quantized audio sonar grid
+    peakCutIdx: -1,
+    peakCutScore: 0,
+  },
+
   cfg: {
     ...defaultConfig(),
     partials: 512,
@@ -76,43 +89,51 @@ const app = {
   dirty: true,
   rendered: false,
   lastRenderMs: 0,
-  statusNote: "Connect local fas.exe (ws://127.0.0.1:3003) for live 512-osc Fragment synthesis",
+  statusNote: "Connect local fas.exe (ws://127.0.0.1:3003) or load a Flipbook Sequence",
 
   mediaSeq: 0,
   clipSeq: 0,
-  mediaPool: new Map(),
+  mediaPool: new Map(), // mediaId -> { mediaId, filename, width, height, rgba, thumbUrl, origCanvas }
   mediaOrder: [],
   clips: [],
 
-  // Pre-synthesis aligned planes & canvases (synced 1:1 with FAS height `h`!)
-  planes: [],
+  // Audio-grid synthesis planes ([h, C])
+  planes: [],           // polarity-applied full-frame planes
+  demodPlanes: [],      // positive un-flipped planes
+  eventOnPlanes: [],    // Event-Cam +ON advancing motion (Left / R)
+  eventOffPlanes: [],   // Event-Cam -OFF receding motion (Right / G)
+  eventMixPlanes: [],   // Event-Cam max(on, off) for mono WAV
+  chromaPlanes: [],     // Color warmth [h, C] for FAS Blue channel
   planeP: 512,
   planeC: 120,
+
+  // Visual caches (audio-grid sonar vs. crisp 16:9 Hi-Res flipbook)
   clipThumbUrls: [],
   clipCanvases: [],
   clipDemodCanvases: [],
   clipEventCanvases: [],
+  hiResOrigCanvases: [],
+  hiResRawCanvases: [],
+  hiResDemodCanvases: [],
+  hiResEventCanvases: [],
   stitchedCanvas: null,
   seams: [],
   seamCanvases: [],
 
   // Optional offline WAV artifacts
   masterSpecCanvas: null,
-  stftRawFrames: [],
-  stftDemodFrames: [],
-  stftEventFrames: [],
   masterWavUrl: null,
   audioBuffer: null,
 
   // View & transport state
   monMode: "timeline", // "timeline" | "clip" | "seam" | "video" | "master"
-  videoMode: "demod",  // "demod" | "raw" | "event"
+  videoMode: "event",  // "event" | "demod" | "raw" | "orig"
   selectedClipIdx: 0,
   selectedSeamIdx: 0,
   dragPayload: null,
   loop: true,
   playing: false,
-  playEngine: "none",  // "fas" | "webaudio" | "none"
+  playEngine: "none",
   playOffset: 0,
   playStartCtxTime: 0,
   audioCtx: null,
@@ -124,7 +145,6 @@ const app = {
   sliceScratch: new Uint8Array(512 * 4),
 };
 
-// --- Fragment Audio Server (grz0zrg/fas) Client ---
 const fas = new FasClient({
   onStatus: (connected, msg) => {
     app.fasConnected = connected;
@@ -159,19 +179,13 @@ function setBusy(on, text = "Working…") {
 
 function nextMediaId() { return `m_${String(++app.mediaSeq).padStart(3, "0")}`; }
 function nextClipId() { return `c_${String(++app.clipSeq).padStart(3, "0")}`; }
-
-function totalDurationS() {
-  return app.clips.length * (Number(app.cfg.slotDurationS) || 2.0);
-}
-
-function hasNegativeClip() {
-  return app.clips.some((c) => c.polarity === "neg");
-}
+function totalDurationS() { return app.clips.length * (Number(app.cfg.slotDurationS) || 2.0); }
 
 function addMediaFromRGBA(filename, rgba, width, height) {
   const mediaId = nextMediaId();
+  const origCanvas = rgbaToCanvas(rgba, width, height);
   const thumbUrl = makeThumbDataUrl(rgba, width, height);
-  const item = { mediaId, filename, width, height, rgba, thumbUrl };
+  const item = { mediaId, filename, width, height, rgba, thumbUrl, origCanvas };
   app.mediaPool.set(mediaId, item);
   app.mediaOrder.push(mediaId);
   return item;
@@ -193,7 +207,7 @@ function applyAlternatingPolarities(startPol = "pos") {
   app.clips.forEach((c, i) => { c.polarity = i % 2 === 0 ? first : second; });
 }
 
-function addClip(mediaId, polarity = "pos", insertIndex = null) {
+function addClip(mediaId, polarity = "pos", insertIndex = null, skipRecompute = false) {
   if (app.clips.length >= MAX_CLIPS) return;
   const item = app.mediaPool.get(mediaId);
   if (!item) return;
@@ -210,10 +224,12 @@ function addClip(mediaId, polarity = "pos", insertIndex = null) {
   } else {
     app.clips.push(clip);
   }
-  if (app.breathingEnabled && insertIndex === null && polarity === "pos") {
-    applyAlternatingPolarities("pos");
+  if (!skipRecompute) {
+    if (app.breathingEnabled && insertIndex === null && polarity === "pos") {
+      applyAlternatingPolarities("pos");
+    }
+    markDirty(`Added ${clip.title} (${clip.polarity})`);
   }
-  markDirty(`Added ${clip.title} (${clip.polarity})`);
 }
 
 function markDirty(note) {
@@ -223,9 +239,9 @@ function markDirty(note) {
   renderUI();
 }
 
-// Compute exact FAS-aligned [h, C] partial planes, stitched timeline canvas, and 4-state Seam Deltas
+// Compute FAS-aligned [h, C] planes, Event-Cam (+ON/-OFF) + Phosphor Trail, Chroma Warmth,
+// Hi-Res 16:9 flipbook frames, Scene-Cut Peak detector, and 4-state Seam Deltas.
 function recomputeTimelinePlanes() {
-  // Align plane vertical rows `P` 1:1 with FAS oscillator bank height `h` and log frequency lattice!
   const h = Number(app.fasCfg.h) || 512;
   const oct = Number(app.fasCfg.octaves) || 10;
   const baseF = Number(app.fasCfg.baseFreq) || 16.35;
@@ -237,154 +253,222 @@ function recomputeTimelinePlanes() {
   app.cfg.freqScale = "log";
   app.cfg.pps = Number(app.fasCfg.fps) || 60;
 
-  if (app.sliceScratch.length !== h * 4) {
-    app.sliceScratch = new Uint8Array(h * 4);
-  }
+  if (app.sliceScratch.length !== h * 4) app.sliceScratch = new Uint8Array(h * 4);
 
   const freqs = buildFreqGrid(app.cfg);
-  const bypassEq = true;
+  const nClips = app.clips.length;
+  const fastStripMode = nClips > 28; // skip heavy per-clip dataURL PNG encoding for 100-frame sequences
 
   app.planes = [];
+  app.demodPlanes = [];
+  app.chromaPlanes = [];
   app.clipCanvases = [];
   app.clipDemodCanvases = [];
   app.clipThumbUrls = [];
+  app.hiResOrigCanvases = [];
+  app.hiResRawCanvases = [];
+  app.hiResDemodCanvases = [];
+  app.hiResEventCanvases = [];
+
   app.planeP = h;
   app.planeC = Math.max(8, Math.round((Number(app.cfg.slotDurationS) || 2.0) * (Number(app.fasCfg.fps) || 60)));
 
-  const demodPlanes = [];
-  for (const clip of app.clips) {
+  // 1. Audio-grid planes [h, C] + Chroma Warmth + Hi-Res 240x135 Flipbook luma
+  const hiResLumaList = [];
+  const hiCfg = { ...app.cfg, partials: HI_RES_H, pps: HI_RES_W / Math.max(0.05, Number(app.cfg.slotDurationS) || 0.125), featherMs: 0 };
+
+  for (let i = 0; i < nClips; i++) {
+    const clip = app.clips[i];
     const item = app.mediaPool.get(clip.mediaId);
     if (!item) continue;
+
     const { plane, P, C } = rgbaToConditionedPlane(
-      item.rgba,
-      item.width,
-      item.height,
-      app.cfg,
-      clip.polarity,
-      clip.condMode,
-      bypassEq
+      item.rgba, item.width, item.height, app.cfg, clip.polarity, clip.condMode, true
     );
     app.planeP = P;
     app.planeC = C;
     app.planes.push(plane);
 
-    const greenRgba = renderPlaneGreenRGBA(plane, P, C);
-    const cv = rgbaToCanvas(greenRgba, C, P);
-    app.clipCanvases.push(cv);
-    app.clipThumbUrls.push(cv.toDataURL("image/png"));
-
-    // Demodulated positive plane for clean live flipbook / Event-Cam view
     const dem = new Float32Array(plane.length);
     if (clip.polarity === "neg") {
-      for (let i = 0; i < plane.length; i++) dem[i] = 1.0 - plane[i];
+      for (let k = 0; k < plane.length; k++) dem[k] = 1.0 - plane[k];
     } else {
       dem.set(plane);
     }
-    demodPlanes.push(dem);
+    app.demodPlanes.push(dem);
+    app.chromaPlanes.push(rgbaToChromaWarmthPlane(item.rgba, item.width, item.height, P, C));
+
+    const greenRgba = renderPlaneGreenRGBA(plane, P, C);
+    const cv = rgbaToCanvas(greenRgba, C, P);
+    app.clipCanvases.push(cv);
     app.clipDemodCanvases.push(rgbaToCanvas(renderPlaneGreenRGBA(dem, P, C), C, P));
+    // Fast thumbnail strategy: reuse Media Bay thumbnail for >28 clips so 100-frame DBZ timeline stays 60fps
+    app.clipThumbUrls.push(fastStripMode ? item.thumbUrl : cv.toDataURL("image/png"));
+
+    // Hi-Res 240x135 visual flipbook frames (always crisp 16:9 anime detail!)
+    app.hiResOrigCanvases.push(item.origCanvas);
+    const hiPos = rgbaToConditionedPlane(item.rgba, item.width, item.height, hiCfg, "pos", clip.condMode, true);
+    hiResLumaList.push(hiPos.plane);
+    app.hiResDemodCanvases.push(rgbaToCanvas(renderPlaneGreenRGBA(hiPos.plane, HI_RES_H, HI_RES_W), HI_RES_W, HI_RES_H));
+
+    if (clip.polarity === "neg") {
+      const hiNeg = new Float32Array(hiPos.plane.length);
+      for (let k = 0; k < hiNeg.length; k++) hiNeg[k] = 1.0 - hiPos.plane[k];
+      app.hiResRawCanvases.push(rgbaToCanvas(renderPlaneGreenRGBA(hiNeg, HI_RES_H, HI_RES_W), HI_RES_W, HI_RES_H));
+    } else {
+      app.hiResRawCanvases.push(app.hiResDemodCanvases[app.hiResDemodCanvases.length - 1]);
+    }
   }
 
-  // Build stitched timeline canvas (what streams live to FAS!)
-  if (app.clipCanvases.length > 0) {
+  // 2. Neuromorphic Event-Camera (+ON / -OFF) with Phosphor Persistence Trail
+  const evAudio = computeEventCameraSequence(app.demodPlanes, app.planeP, app.planeC, {
+    threshold: 0.045,
+    gain: 1.85,
+    decay: app.flipbook.trailDecay,
+  });
+  app.eventOnPlanes = evAudio.onPlanes;
+  app.eventOffPlanes = evAudio.offPlanes;
+  app.eventMixPlanes = evAudio.mixPlanes;
+
+  app.clipEventCanvases = [];
+  for (let k = 0; k < app.eventOnPlanes.length; k++) {
+    app.clipEventCanvases.push(
+      rgbaToCanvas(renderEventOnOffRGBA(app.eventOnPlanes[k], app.eventOffPlanes[k], app.planeP, app.planeC), app.planeC, app.planeP)
+    );
+  }
+
+  const evHi = computeEventCameraSequence(hiResLumaList, HI_RES_H, HI_RES_W, {
+    threshold: 0.045,
+    gain: 2.1,
+    decay: app.flipbook.trailDecay,
+  });
+  for (let k = 0; k < evHi.onPlanes.length; k++) {
+    app.hiResEventCanvases.push(
+      rgbaToCanvas(renderEventOnOffRGBA(evHi.onPlanes[k], evHi.offPlanes[k], HI_RES_H, HI_RES_W), HI_RES_W, HI_RES_H)
+    );
+  }
+
+  // Detect strongest scene cut (ignoring wrap-around k=0 when >2 frames)
+  let peakIdx = -1;
+  let peakScore = 0;
+  for (let k = 1; k < evHi.frameMotionScores.length; k++) {
+    if (evHi.frameMotionScores[k] > peakScore) {
+      peakScore = evHi.frameMotionScores[k];
+      peakIdx = k;
+    }
+  }
+  app.flipbook.peakCutIdx = peakIdx;
+  app.flipbook.peakCutScore = peakScore;
+
+  // 3. Stitched timeline canvas (reflects active Synth Source: Event-Cam, Hybrid, or Full Frame!)
+  if (nClips > 0) {
+    const srcArr = app.flipbook.synthSource === "event" ? app.clipEventCanvases : app.clipCanvases;
+    const totalW = Math.min(4096, app.planeC * nClips);
+    const colW = totalW / nClips;
     const st = document.createElement("canvas");
-    st.width = app.planeC * app.clipCanvases.length;
+    st.width = totalW;
     st.height = app.planeP;
     const sctx = st.getContext("2d");
-    app.clipCanvases.forEach((cv, i) => sctx.drawImage(cv, i * app.planeC, 0));
+    srcArr.forEach((cv, i) => sctx.drawImage(cv, i * colW, 0, colW, app.planeP));
     app.stitchedCanvas = st;
   } else {
     app.stitchedCanvas = null;
   }
 
-  // Event-camera live diff frames & 4-state Endomorphic Seam Deltas
-  app.clipEventCanvases = [];
-  for (let k = 0; k < demodPlanes.length; k++) {
-    const prev = demodPlanes[(k - 1 + demodPlanes.length) % demodPlanes.length];
-    const curr = demodPlanes[k];
-    const evRgba = new Uint8ClampedArray(app.planeP * app.planeC * 4);
-    for (let r = 0; r < app.planeP; r++) {
-      const srcRow = (app.planeP - 1 - r) * app.planeC;
-      const dstRow = r * app.planeC;
-      for (let c = 0; c < app.planeC; c++) {
-        const d = curr[srcRow + c] - prev[srcRow + c];
-        const o = (dstRow + c) * 4;
-        if (d > 0.06) {
-          const m = Math.min(1, d / 0.7);
-          evRgba[o] = Math.round(m * 30);
-          evRgba[o + 1] = Math.round(m * 235);
-          evRgba[o + 2] = Math.round(m * 255);
-        } else if (d < -0.06) {
-          const m = Math.min(1, -d / 0.7);
-          evRgba[o] = Math.round(m * 255);
-          evRgba[o + 1] = Math.round(m * 110);
-          evRgba[o + 2] = Math.round(m * 30);
-        }
-        evRgba[o + 3] = 255;
-      }
-    }
-    app.clipEventCanvases.push(rgbaToCanvas(evRgba, app.planeC, app.planeP));
-  }
-
+  // 4. 4-State Endomorphic Seam Deltas
   app.seams = [];
   app.seamCanvases = [];
   for (let i = 0; i < app.planes.length - 1; i++) {
     const d = computeSeamDelta(
-      app.planes[i],
-      app.planes[i + 1],
-      app.planeP,
-      app.planeC,
-      freqs,
-      app.clips[i],
-      app.clips[i + 1],
-      i
+      app.planes[i], app.planes[i + 1], app.planeP, app.planeC, freqs, app.clips[i], app.clips[i + 1], i
     );
     app.seams.push(d);
-    const sRgba = renderSeamDeltaRGBA(app.planes[i], app.planes[i + 1], app.planeP, app.planeC);
-    app.seamCanvases.push(rgbaToCanvas(sRgba, app.planeC, app.planeP));
+    if (!fastStripMode) {
+      app.seamCanvases.push(
+        rgbaToCanvas(renderSeamDeltaRGBA(app.planes[i], app.planes[i + 1], app.planeP, app.planeC), app.planeC, app.planeP)
+      );
+    }
   }
 
   if (app.selectedClipIdx >= app.clips.length) app.selectedClipIdx = Math.max(0, app.clips.length - 1);
   if (app.selectedSeamIdx >= app.seams.length) app.selectedSeamIdx = Math.max(0, app.seams.length - 1);
 }
 
+function getSeamCanvasLazy(seamIdx) {
+  if (app.seamCanvases[seamIdx]) return app.seamCanvases[seamIdx];
+  if (seamIdx >= 0 && seamIdx < app.planes.length - 1) {
+    const cv = rgbaToCanvas(
+      renderSeamDeltaRGBA(app.planes[seamIdx], app.planes[seamIdx + 1], app.planeP, app.planeC),
+      app.planeC,
+      app.planeP
+    );
+    app.seamCanvases[seamIdx] = cv;
+    return cv;
+  }
+  return null;
+}
+
 /**
  * Extract 1-pixel-wide vertical RGBA slice for Fragment Audio Server at `timeSec`.
- * FAS note.c expects pixel index 0 = lowest frequency (`baseFreq`), index h-1 = highest frequency!
- * Our `planes[clipIdx]` is already bottom-anchored (row 0 = lowest Hz).
+ * Supports:
+ *   - "event":  Left (R) = +ON advancing edges, Right (G) = -OFF receding edges
+ *   - "hybrid": 25% alternating breathing bed + 100% Event-Cam stereo motion spikes
+ *   - "full":   Full frame (+ / - breathing, center mono or L/R breathing split)
+ * Plus optional Chroma Warmth -> Blue (B) secondary FAS synthesis parameter!
  */
 function getFasSliceAt(timeSec) {
   const n = app.planes.length;
   if (n === 0) return null;
-  const dt = Number(app.cfg.slotDurationS) || 2.0;
+  const dt = Number(app.cfg.slotDurationS) || 0.125;
   const clipIdx = Math.min(n - 1, Math.max(0, Math.floor(timeSec / dt)));
   const localFrac = Math.max(0, Math.min(0.999999, (timeSec - clipIdx * dt) / dt));
   const col = Math.min(app.planeC - 1, Math.floor(localFrac * app.planeC));
 
-  const plane = app.planes[clipIdx];
+  const fullPlane = app.planes[clipIdx];
+  const onPlane = app.eventOnPlanes[clipIdx];
+  const offPlane = app.eventOffPlanes[clipIdx];
+  const chromaPlane = app.chromaPlanes[clipIdx];
   const h = app.planeP;
   const C = app.planeC;
   const out = app.sliceScratch;
+  const srcMode = app.flipbook.synthSource;
+  const useChromaB = app.flipbook.chromaBlue;
   const isNeg = app.clips[clipIdx]?.polarity === "neg";
   const breathLR = app.fasCfg.stereoMode === "breath_lr";
 
   for (let r = 0; r < h; r++) {
-    const v = plane[r * C + col];
-    const amp = Math.min(255, Math.max(0, Math.round(v * 255)));
+    const idx = r * C + col;
     const o = r * 4;
-    if (breathLR) {
-      out[o] = isNeg ? Math.round(amp * 0.35) : amp;     // Left (R)
-      out[o + 1] = isNeg ? amp : Math.round(amp * 0.35); // Right (G)
+    let lVal = 0;
+    let rVal = 0;
+
+    if (srcMode === "event") {
+      lVal = onPlane[idx];
+      rVal = offPlane[idx];
+    } else if (srcMode === "hybrid") {
+      const bed = fullPlane[idx] * 0.24;
+      lVal = Math.min(1.0, bed + onPlane[idx]);
+      rVal = Math.min(1.0, bed + offPlane[idx]);
     } else {
-      out[o] = amp;     // Left (R)
-      out[o + 1] = amp; // Right (G)
+      const v = fullPlane[idx];
+      if (breathLR) {
+        lVal = isNeg ? v * 0.35 : v;
+        rVal = isNeg ? v : v * 0.35;
+      } else {
+        lVal = v;
+        rVal = v;
+      }
     }
-    out[o + 2] = 0;     // Blue (secondary synth param)
-    out[o + 3] = 255;   // Alpha
+
+    out[o] = Math.min(255, Math.max(0, Math.round(lVal * 255)));
+    out[o + 1] = Math.min(255, Math.max(0, Math.round(rVal * 255)));
+    out[o + 2] = useChromaB ? Math.min(255, Math.max(0, Math.round(chromaPlane[idx] * 255))) : 0;
+    out[o + 3] = 255;
   }
   return out;
 }
 
-// --- Playback Control (Primary: FAS Live 60fps | Fallback: Offline WebAudio WAV) ---
+// --- Playback Control ---
 function ensureAudio() {
   if (!app.audioCtx) {
     const AC = window.AudioContext || window.webkitAudioContext;
@@ -409,9 +493,7 @@ function currentPlayheadSec() {
 
 function stopPlayback(keepOffset = true) {
   if (keepOffset && app.playing) app.playOffset = currentPlayheadSec();
-  if (app.playEngine === "fas") {
-    fas.stopStream(true);
-  }
+  if (app.playEngine === "fas") fas.stopStream(true);
   if (app.sourceNode) {
     try { app.sourceNode.onended = null; app.sourceNode.stop(); } catch (_) {}
     app.sourceNode.disconnect();
@@ -427,7 +509,6 @@ function startPlayback(offsetSec = null) {
   const dur = totalDurationS();
   const off = offsetSec !== null ? Math.max(0, Math.min(dur - 0.001, offsetSec)) : (app.playOffset % dur);
 
-  // 1. Primary path: live stream straight to native C11 Fragment Audio Server!
   if (app.fasConnected) {
     stopPlayback(false);
     app.playOffset = off;
@@ -450,7 +531,6 @@ function startPlayback(offsetSec = null) {
     return;
   }
 
-  // 2. Fallback path: Offline Browser WAV if already synthesized
   if (app.audioBuffer) {
     ensureAudio();
     stopPlayback(false);
@@ -476,32 +556,67 @@ function startPlayback(offsetSec = null) {
     return;
   }
 
-  app.statusNote = "FAS not connected — click Connect FAS (start fas.exe) or click Offline WAV";
+  app.statusNote = "FAS not connected — click Connect FAS (start_fas.bat) or click Offline WAV";
   renderUI();
 }
 
-// --- Optional Offline Browser WAV Synthesis Fallback ---
+// --- Offline Browser WAV Synthesis (Respects Event-Cam / Hybrid / Full Synth Source!) ---
 function ensureWorker() {
   if (!app.worker) app.worker = new Worker("./js/synth_worker.js", { type: "module" });
   return app.worker;
 }
 
-function synthesizeOfflineWav({ autoDownload = false } = {}) {
+function buildActiveAudioPlanesForOffline() {
+  const src = app.flipbook.synthSource;
+  if (src === "event") {
+    return app.eventMixPlanes.map((pl) => new Float32Array(pl));
+  }
+  if (src === "hybrid") {
+    return app.planes.map((full, i) => {
+      const ev = app.eventMixPlanes[i];
+      const out = new Float32Array(full.length);
+      for (let k = 0; k < out.length; k++) out[k] = Math.min(1.0, full[k] * 0.24 + ev[k]);
+      return out;
+    });
+  }
+  return app.planes.map((pl) => new Float32Array(pl));
+}
+
+function synthesizeOfflineWav({ autoDownload = false, autoPlay = false } = {}) {
   if (app.clips.length === 0) return;
   stopPlayback(false);
   recomputeTimelinePlanes();
 
   const worker = ensureWorker();
   const jobId = ++app.jobSeq;
-  setBusy(true, "Rendering Offline WAV…");
+  setBusy(true, `Rendering Offline WAV (${app.flipbook.synthSource})…`);
 
-  const planesCopy = app.planes.map((pl) => new Float32Array(pl));
-  const transfers = planesCopy.map((pl) => pl.buffer);
+  // Keep offline browser synthesis snappy for 100-frame sequences by capping offline partials at 220 if >32 clips
+  const rawPlanes = buildActiveAudioPlanesForOffline();
+  let useP = app.planeP;
+  let sendPlanes = rawPlanes;
+  if (app.clips.length > 32 && useP > 200) {
+    const stride = Math.ceil(useP / 180);
+    const newP = Math.ceil(useP / stride);
+    sendPlanes = rawPlanes.map((pl) => {
+      const ds = new Float32Array(newP * app.planeC);
+      for (let r = 0; r < newP; r++) {
+        const srcRow = Math.min(useP - 1, r * stride) * app.planeC;
+        ds.set(pl.subarray(srcRow, srcRow + app.planeC), r * app.planeC);
+      }
+      return ds;
+    });
+    useP = newP;
+  }
+
+  const transfers = sendPlanes.map((pl) => pl.buffer);
   const offlineCfg = {
     ...app.cfg,
+    partials: useP,
     sr: 48000,
     bitDepth: 24,
     fftSize: app.cfg.slotDurationS < 0.35 ? 1024 : 2048,
+    slotGapMs: app.cfg.slotDurationS < 0.25 ? 4.0 : 12.0,
     phaseMode: "schroeder",
   };
 
@@ -534,29 +649,31 @@ function synthesizeOfflineWav({ autoDownload = false } = {}) {
       }
       app.dirty = false;
       app.rendered = true;
-      app.statusNote = `Offline WAV ready (${(wavBlob.size / 1024).toFixed(0)} KB · ${msg.elapsedMs.toFixed(0)} ms)`;
+      app.statusNote = `Offline WAV (${app.flipbook.synthSource}) ready (${(wavBlob.size / 1024).toFixed(0)} KB · ${msg.elapsedMs.toFixed(0)} ms)`;
       renderUI();
+      if (autoPlay) startPlayback(0);
       if (autoDownload) $("btn-dl-wav").click();
     }
   };
 
-  worker.postMessage({ jobId, planes: planesCopy, P: app.planeP, C: app.planeC, cfg: offlineCfg }, transfers);
+  worker.postMessage({ jobId, planes: sendPlanes, P: useP, C: app.planeC, cfg: offlineCfg }, transfers);
 }
 
-// --- Exports: Stitched Breathing PNG Strip + Seam Delta JSON ---
+// --- Exports ---
 function exportStitchedStripPng() {
   if (!app.stitchedCanvas) return;
   const a = document.createElement("a");
   a.href = app.stitchedCanvas.toDataURL("image/png");
-  a.download = `spectral_timeline_strip_${app.clips.length}clips_${app.planeP}h.png`;
+  a.download = `spectral_timeline_${app.flipbook.synthSource}_${app.clips.length}f_${app.planeP}h.png`;
   a.click();
 }
 
 function downloadTimelineJSON() {
   const payload = {
-    tool: "spectral-timeline-fas",
+    tool: "spectral-timeline-fas-flipbook",
     exportedAt: new Date().toISOString(),
     fasConfig: app.fasCfg,
+    flipbook: app.flipbook,
     slotDurationS: app.cfg.slotDurationS,
     breathingEnabled: app.breathingEnabled,
     clips: app.clips.map((c, i) => ({ index: i, title: c.title, polarity: c.polarity, condMode: c.condMode })),
@@ -589,36 +706,43 @@ function drawLoop() {
   const t = currentPlayheadSec();
 
   if (app.monMode === "video") {
-    const frames = app.videoMode === "raw"
-      ? app.clipCanvases
-      : app.videoMode === "event"
-        ? app.clipEventCanvases
-        : app.clipDemodCanvases;
+    const hi = app.flipbook.hiResMode;
+    let frames;
+    if (app.videoMode === "orig") frames = app.hiResOrigCanvases;
+    else if (app.videoMode === "raw") frames = hi ? app.hiResRawCanvases : app.clipCanvases;
+    else if (app.videoMode === "event") frames = hi ? app.hiResEventCanvases : app.clipEventCanvases;
+    else frames = hi ? app.hiResDemodCanvases : app.clipDemodCanvases;
+
     if (frames.length > 0) {
       const idx = app.playing
         ? Math.min(frames.length - 1, Math.floor((t / dur) * frames.length))
         : Math.min(frames.length - 1, app.selectedClipIdx);
       const fr = frames[idx];
+      const targetAspect = hi ? (16 / 9) : (4 / 3);
       const padY = 44 * dpr;
       const drawH = Math.max(40, h - padY * 1.3);
-      const drawW = Math.min(w - 24 * dpr, drawH * (4 / 3));
+      const drawW = Math.min(w - 24 * dpr, drawH * targetAspect);
       const dx = Math.floor((w - drawW) / 2);
       const dy = Math.floor((h - drawH) / 2 + 8 * dpr);
 
       ctx.imageSmoothingEnabled = true;
       ctx.drawImage(fr, dx, dy, drawW, drawH);
-      ctx.strokeStyle = app.clips[idx]?.polarity === "neg" ? "rgba(72, 201, 240, 0.55)" : "rgba(56, 212, 122, 0.55)";
-      ctx.lineWidth = Math.max(1.5, dpr);
+
+      const isCut = idx === app.flipbook.peakCutIdx && app.flipbook.peakCutScore > 0.14;
+      ctx.strokeStyle = isCut
+        ? "rgba(245, 166, 35, 0.9)"
+        : (app.clips[idx]?.polarity === "neg" ? "rgba(72, 201, 240, 0.55)" : "rgba(56, 212, 122, 0.55)");
+      ctx.lineWidth = (isCut ? 2.5 : 1.5) * dpr;
       ctx.strokeRect(dx, dy, drawW, drawH);
 
-      // Playhead bar
       ctx.fillStyle = "rgba(255,255,255,0.1)";
       ctx.fillRect(dx, dy + drawH + 6 * dpr, drawW, 4 * dpr);
-      ctx.fillStyle = "#38d47a";
+      ctx.fillStyle = isCut ? "#f5a623" : "#38d47a";
       ctx.fillRect(dx, dy + drawH + 6 * dpr, drawW * (t / dur), 4 * dpr);
 
       const polTag = app.clips[idx]?.polarity === "neg" ? "− NEG" : "+ POS";
-      $("video-frame-badge").textContent = `Frame ${idx + 1}/${frames.length} · ${polTag} · ${app.clips[idx]?.title || ""}`;
+      const cutTag = isCut ? " · ★ CUT" : "";
+      $("video-frame-badge").textContent = `Frame ${idx + 1}/${frames.length} · ${polTag}${cutTag} · ${app.clips[idx]?.title || ""}`;
       $("hud-time").textContent = `${t.toFixed(2)} / ${totalDurationS().toFixed(2)} s`;
     }
     requestAnimationFrame(drawLoop);
@@ -628,7 +752,7 @@ function drawLoop() {
   let srcCanvas = null;
   if (app.monMode === "timeline") srcCanvas = app.stitchedCanvas;
   else if (app.monMode === "master") srcCanvas = app.masterSpecCanvas;
-  else if (app.monMode === "seam") srcCanvas = app.seamCanvases[app.selectedSeamIdx] || null;
+  else if (app.monMode === "seam") srcCanvas = getSeamCanvasLazy(app.selectedSeamIdx);
   else srcCanvas = app.clipCanvases[app.selectedClipIdx] || null;
 
   if (srcCanvas) {
@@ -638,28 +762,30 @@ function drawLoop() {
     ctx.fillStyle = "#5c677a";
     ctx.font = `${13 * dpr}px ui-monospace, monospace`;
     ctx.textAlign = "center";
-    ctx.fillText("Add clips to Timeline · Connect FAS (ws://127.0.0.1:3003) · Press Space to stream live", w / 2, h / 2);
+    ctx.fillText("Load a Flipbook Sequence (e.g. dbzframexz/*.png) · Connect FAS or click Offline WAV", w / 2, h / 2);
   }
 
-  // Draw slot dividers & live FAS / WebAudio scanline on stitched views
   if ((app.monMode === "timeline" || app.monMode === "master") && app.clips.length > 0) {
     const n = app.clips.length;
-    ctx.strokeStyle = "rgba(255, 255, 255, 0.16)";
-    ctx.lineWidth = Math.max(1, dpr);
-    for (let i = 1; i < n; i++) {
-      const x = (i / n) * w;
-      ctx.beginPath();
-      ctx.moveTo(x, 0);
-      ctx.lineTo(x, h);
-      ctx.stroke();
+    if (n <= 40) {
+      ctx.strokeStyle = "rgba(255, 255, 255, 0.14)";
+      ctx.lineWidth = Math.max(1, dpr);
+      for (let i = 1; i < n; i++) {
+        const x = (i / n) * w;
+        ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
+      }
+    }
+    // Highlight detected scene cut line on stitched timeline
+    if (app.flipbook.peakCutIdx > 0 && app.flipbook.peakCutScore > 0.14) {
+      const cx = (app.flipbook.peakCutIdx / n) * w;
+      ctx.strokeStyle = "rgba(245, 166, 35, 0.75)";
+      ctx.lineWidth = 2 * dpr;
+      ctx.beginPath(); ctx.moveTo(cx, 0); ctx.lineTo(cx, h); ctx.stroke();
     }
     const px = (t / dur) * w;
     ctx.strokeStyle = app.fasConnected ? "#ffd24c" : "#38d47a";
     ctx.lineWidth = 2 * dpr;
-    ctx.beginPath();
-    ctx.moveTo(px, 0);
-    ctx.lineTo(px, h);
-    ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(px, 0); ctx.lineTo(px, h); ctx.stroke();
   }
   $("hud-time").textContent = `${t.toFixed(2)} / ${totalDurationS().toFixed(2)} s`;
 
@@ -683,34 +809,47 @@ function renderUI() {
 
   $("hud-note").textContent = app.statusNote;
   const methodName = (FAS_SYNTH_METHODS.find((m) => m.id === app.fasCfg.method) || FAS_SYNTH_METHODS[0]).name;
+  const srcLbl = app.flipbook.synthSource === "event" ? "EVENT-CAM Δ" : app.flipbook.synthSource === "hybrid" ? "HYBRID" : "FULL BREATH";
   $("engine-badge").textContent = app.fasConnected
-    ? `Engine: Fragment FAS LIVE (${app.fasCfg.h} oscs · ${methodName} · ${app.fasCfg.fps} fps)`
+    ? `FAS LIVE (${app.fasCfg.h} oscs · ${methodName} · ${srcLbl})`
     : app.audioBuffer
-      ? "Engine: Offline Browser WAV Ready (or click Connect FAS)"
-      : "Engine: FAS Offline — start fas.exe & click Connect FAS (or Offline WAV)";
+      ? `Offline WAV Ready (${srcLbl}) — or Connect FAS`
+      : `FAS Offline (${srcLbl}) — start_fas.bat or Offline WAV`;
 
   const dl = $("btn-dl-wav");
   dl.classList.toggle("hidden", !app.masterWavUrl);
   if (app.masterWavUrl) dl.href = app.masterWavUrl;
 
-  $("breathing-rms-lbl").textContent = `${app.fasCfg.h} oscs · ${app.fasCfg.baseFreq} Hz × 2^${app.fasCfg.octaves} (${Math.round(app.fasCfg.baseFreq * Math.pow(2, app.fasCfg.octaves))} Hz)`;
+  $("breathing-rms-lbl").textContent = `${app.fasCfg.h} oscs · ${srcLbl} · trail=${app.flipbook.trailDecay}`;
 
   const bBtn = $("btn-breathing");
   bBtn.textContent = `Breathing (+/−): ${app.breathingEnabled ? "ON" : "OFF"}`;
   bBtn.classList.toggle("active", app.breathingEnabled);
 
+  // Peak cut jump button
+  const cutBtn = $("btn-jump-cut");
+  if (app.flipbook.peakCutIdx > 0) {
+    cutBtn.classList.remove("hidden");
+    cutBtn.textContent = `★ Peak Cut: #${app.flipbook.peakCutIdx + 1} (Δ=${app.flipbook.peakCutScore.toFixed(2)})`;
+  } else {
+    cutBtn.classList.add("hidden");
+  }
+
   document.querySelectorAll(".mon-tab").forEach((b) => b.classList.toggle("active", b.dataset.mon === app.monMode));
   $("seam-legend").classList.toggle("hidden", app.monMode !== "seam");
   $("video-bar").classList.toggle("hidden", app.monMode !== "video");
-  document.querySelectorAll(".vmode-btn").forEach((b) => b.classList.toggle("active", b.dataset.vmode === app.videoMode));
+  document.querySelectorAll(".vmode-btn[data-vmode]").forEach((b) => b.classList.toggle("active", b.dataset.vmode === app.videoMode));
+  const vresBtn = $("btn-vres-toggle");
+  vresBtn.textContent = app.flipbook.hiResMode ? "Hi-Res 16:9" : "Sonar Grid";
+  vresBtn.classList.toggle("active", app.flipbook.hiResMode);
 
   if (app.monMode === "timeline") {
-    $("mon-info").textContent = `Stitched FAS Bank (${app.clips.length} clips · ${app.planeP} oscs × ${app.planeC * app.clips.length} cols) · Click canvas to scrub`;
+    $("mon-info").textContent = `Stitched ${srcLbl} Stream (${app.clips.length} clips · ${totalDurationS().toFixed(2)}s) · Click canvas to scrub`;
   } else if (app.monMode === "video") {
-    const fps = (1 / Math.max(0.05, Number(app.cfg.slotDurationS) || 0.5)).toFixed(1);
-    $("mon-info").textContent = `Live Flipbook (${fps} fps) · Synced to ${app.fasConnected ? "Fragment FAS" : "Timeline"} Playhead`;
+    const fps = (1 / Math.max(0.02, Number(app.cfg.slotDurationS) || 0.125)).toFixed(1);
+    $("mon-info").textContent = `Flipbook (${fps} fps · ${app.flipbook.hiResMode ? "Hi-Res 16:9" : "Sonar Grid"}) · Audio=${srcLbl}`;
   } else if (app.monMode === "master") {
-    $("mon-info").textContent = app.rendered ? "Offline Browser WAV STFT Preview" : "Click Offline WAV to generate a browser WAV preview";
+    $("mon-info").textContent = app.rendered ? "Offline Browser WAV STFT Preview" : "Click Offline WAV to render browser WAV";
   } else if (app.monMode === "seam") {
     const sm = app.seams[app.selectedSeamIdx];
     $("mon-info").textContent = sm
@@ -718,12 +857,10 @@ function renderUI() {
       : "Add 2+ clips to inspect Seam Delta";
   } else {
     const clip = app.clips[app.selectedClipIdx];
-    $("mon-info").textContent = clip
-      ? `Slot ${app.selectedClipIdx + 1}: ${clip.title} · ${clip.polarity === "neg" ? "NEGATIVE (black on green)" : "POSITIVE (green on black)"}`
-      : "Drag images from Media Bay onto the Timeline";
+    $("mon-info").textContent = clip ? `Slot ${app.selectedClipIdx + 1}: ${clip.title} (${clip.polarity})` : "Add clips to Timeline";
   }
 
-  // Media Bay
+  // Media Bay (cap visible cards cleanly if 100+ items, keeping scrollable performance smooth)
   const grid = $("media-grid");
   grid.innerHTML = "";
   app.mediaOrder.forEach((mid) => {
@@ -733,8 +870,8 @@ function renderUI() {
     card.className = "media-card";
     card.draggable = true;
     card.innerHTML = `
-      <button class="media-del-btn" title="Remove from Media Bay">✕</button>
-      <img src="${m.thumbUrl}" alt="${m.filename}" draggable="false" />
+      <button class="media-del-btn" title="Remove">✕</button>
+      <img src="${m.thumbUrl}" alt="${m.filename}" loading="lazy" draggable="false" />
       <div class="media-meta">
         <div class="media-name mono" title="${m.filename}">${m.filename}</div>
         <div class="media-actions">
@@ -746,7 +883,6 @@ function renderUI() {
     card.addEventListener("dragstart", (ev) => {
       app.dragPayload = { kind: "media", mediaId: m.mediaId };
       ev.dataTransfer.effectAllowed = "copy";
-      ev.dataTransfer.setData("text/plain", `media:${m.mediaId}`);
     });
     card.addEventListener("dragend", () => { app.dragPayload = null; clearTimelineDropHighlights(); });
     card.querySelector(".media-del-btn").addEventListener("click", (ev) => { ev.stopPropagation(); deleteMedia(m.mediaId); });
@@ -765,25 +901,27 @@ function renderUI() {
   });
 
   // Timeline Strip
-  const dt = Number(app.cfg.slotDurationS) || 2.0;
-  $("tl-summary").textContent = `${app.clips.length} / ${MAX_CLIPS} clips · ${totalDurationS().toFixed(2)} s`;
+  const dt = Number(app.cfg.slotDurationS) || 0.125;
+  const fastStripMode = app.clips.length > 28;
+  $("tl-summary").textContent = `${app.clips.length} / ${MAX_CLIPS} clips · ${totalDurationS().toFixed(2)} s (${(1 / dt).toFixed(1)} fps)`;
   const strip = $("timeline-strip");
   strip.innerHTML = "";
   app.clips.forEach((c, idx) => {
     const card = document.createElement("div");
     card.className = `clip-card pol-${c.polarity}` + (idx === app.selectedClipIdx ? " selected" : "");
     card.draggable = true;
+    const invCss = fastStripMode && c.polarity === "neg" ? " inv-css" : "";
     card.innerHTML = `
       <div class="clip-top mono">
         <span>#${String(idx + 1).padStart(2, "0")} · ${(idx * dt).toFixed(2)}s</span>
         <span>
-          <button class="clip-mini" data-act="left" title="Move Left">◀</button>
-          <button class="clip-mini" data-act="right" title="Move Right">▶</button>
-          <button class="clip-mini" data-act="dup" title="Duplicate inverted">±</button>
-          <button class="clip-mini" data-act="del" title="Remove">✕</button>
+          <button class="clip-mini" data-act="left">◀</button>
+          <button class="clip-mini" data-act="right">▶</button>
+          <button class="clip-mini" data-act="dup">±</button>
+          <button class="clip-mini" data-act="del">✕</button>
         </span>
       </div>
-      <img class="clip-thumb" src="${app.clipThumbUrls[idx] || ""}" alt="${c.title}" draggable="false" />
+      <img class="clip-thumb${invCss}" src="${app.clipThumbUrls[idx] || ""}" alt="${c.title}" loading="lazy" draggable="false" />
       <div class="clip-foot">
         <span class="clip-title mono" title="${c.title}">${c.title}</span>
         <button class="pol-btn ${c.polarity}" data-act="pol">${c.polarity === "neg" ? "− NEG" : "+ POS"}</button>
@@ -872,10 +1010,15 @@ function renderUI() {
 
     if (idx < app.seams.length) {
       const sm = app.seams[idx];
+      const isPeakCut = idx + 1 === app.flipbook.peakCutIdx && app.flipbook.peakCutScore > 0.14;
       const chip = document.createElement("button");
-      chip.className = "seam-chip mono" + (sm.isInvertedSeam ? " inverted" : "") + (app.monMode === "seam" && app.selectedSeamIdx === idx ? " selected" : "");
-      chip.title = `Inspect Seam ${idx + 1} (${sm.polarityTransition})`;
-      chip.innerHTML = `<span>Δ${idx + 1}</span><span>${sm.isInvertedSeam ? "⇄" : "→"}</span><span>${sm.rectifiedFlux.toFixed(2)}</span>`;
+      chip.className = "seam-chip mono"
+        + (isPeakCut ? " cut-peak" : (sm.isInvertedSeam ? " inverted" : ""))
+        + (app.monMode === "seam" && app.selectedSeamIdx === idx ? " selected" : "");
+      chip.title = isPeakCut ? `★ PEAK SCENE CUT at Frame #${idx + 2}` : `Inspect Seam ${idx + 1} (${sm.polarityTransition})`;
+      chip.innerHTML = isPeakCut
+        ? `<span>★CUT</span><span>#${idx + 2}</span><span>${sm.rectifiedFlux.toFixed(2)}</span>`
+        : `<span>Δ${idx + 1}</span><span>${sm.isInvertedSeam ? "⇄" : "→"}</span><span>${sm.rectifiedFlux.toFixed(2)}</span>`;
       chip.addEventListener("click", () => {
         app.selectedSeamIdx = idx;
         app.monMode = "seam";
@@ -885,7 +1028,7 @@ function renderUI() {
     }
   });
 
-  // FAS controls sync
+  // Sync FAS & Flipbook controls
   const mSel = $("fas-method");
   if (mSel.options.length === 0) {
     FAS_SYNTH_METHODS.forEach((m) => {
@@ -904,6 +1047,10 @@ function renderUI() {
   $("fas-stereo").value = app.fasCfg.stereoMode;
   $("cfg-slot-s").value = app.cfg.slotDurationS;
   $("cfg-cond").value = app.cfg.condMode;
+
+  $("seq-synth-src").value = app.flipbook.synthSource;
+  $("seq-trail").value = String(app.flipbook.trailDecay);
+  $("seq-chroma-blue").checked = app.flipbook.chromaBlue;
 
   // Seam Delta Table
   const wrap = $("seam-table-wrap");
@@ -946,23 +1093,77 @@ function renderUI() {
   }
 }
 
+// --- Media Bay & Flipbook Sequence Importers ---
+async function decodeFileToRGBA(file, maxW = 640, maxH = 360) {
+  const bmp = await createImageBitmap(file);
+  const scale = Math.min(1, maxW / bmp.width, maxH / bmp.height);
+  const w = Math.max(8, Math.round(bmp.width * scale));
+  const h = Math.max(8, Math.round(bmp.height * scale));
+  const c = document.createElement("canvas");
+  c.width = w; c.height = h;
+  const cctx = c.getContext("2d");
+  cctx.drawImage(bmp, 0, 0, w, h);
+  const rgba = new Uint8ClampedArray(cctx.getImageData(0, 0, w, h).data);
+  bmp.close();
+  return { rgba, w, h };
+}
+
 async function importFiles(fileList) {
-  for (const file of fileList) {
-    const bmp = await createImageBitmap(file);
-    const maxW = 1280, maxH = 720;
-    const scale = Math.min(1, maxW / bmp.width, maxH / bmp.height);
-    const w = Math.max(8, Math.round(bmp.width * scale));
-    const h = Math.max(8, Math.round(bmp.height * scale));
-    const c = document.createElement("canvas");
-    c.width = w; c.height = h;
-    const cctx = c.getContext("2d");
-    cctx.drawImage(bmp, 0, 0, w, h);
-    const rgba = cctx.getImageData(0, 0, w, h).data;
-    bmp.close();
-    addMediaFromRGBA(file.name, new Uint8ClampedArray(rgba), w, h);
+  const sorted = Array.from(fileList).sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" }));
+  for (const file of sorted) {
+    const { rgba, w, h } = await decodeFileToRGBA(file, 640, 360);
+    addMediaFromRGBA(file.name, rgba, w, h);
     app.statusNote = `Imported to Media Bay: ${file.name} (${w}×${h})`;
   }
   renderUI();
+}
+
+async function importFlipbookSequence(fileList) {
+  const sorted = Array.from(fileList)
+    .filter((f) => /\.(png|jpe?g|webp)$/i.test(f.name) || f.type.startsWith("image/"))
+    .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" }));
+  if (sorted.length === 0) return;
+
+  stopPlayback(false);
+  const stride = Math.max(1, parseInt($("seq-stride").value, 10) || 1);
+  const fps = Math.max(2, parseFloat($("seq-fps").value) || 8);
+  const picked = sorted.filter((_, idx) => idx % stride === 0).slice(0, MAX_CLIPS);
+
+  setBusy(true, `Loading sequence 0 / ${picked.length}…`);
+  app.clips = [];
+  app.cfg.slotDurationS = Number((1.0 / fps).toFixed(4));
+  app.flipbook.synthSource = $("seq-synth-src").value || "event";
+  app.flipbook.trailDecay = parseFloat($("seq-trail").value) || 0;
+  app.flipbook.chromaBlue = $("seq-chroma-blue").checked;
+  app.flipbook.hiResMode = true;
+
+  for (let i = 0; i < picked.length; i++) {
+    if (i % 6 === 0) setBusy(true, `Loading frame ${i + 1} / ${picked.length}…`);
+    // 320x180 keeps 100 frames crisp 16:9 while staying lightweight (~23 MB total)
+    const { rgba, w, h } = await decodeFileToRGBA(picked[i], 320, 180);
+    const m = addMediaFromRGBA(picked[i].name, rgba, w, h);
+    const pol = app.breathingEnabled ? (i % 2 === 0 ? "pos" : "neg") : "pos";
+    addClip(m.mediaId, pol, null, true);
+  }
+
+  setBusy(true, `Computing Event-Cam Δ + Phosphor Trail (${picked.length} frames)…`);
+  await new Promise((r) => setTimeout(r, 15));
+  app.selectedClipIdx = 0;
+  app.selectedSeamIdx = 0;
+  app.monMode = "video";
+  app.videoMode = "event";
+  recomputeTimelinePlanes();
+  setBusy(false);
+
+  const cutMsg = app.flipbook.peakCutIdx > 0 ? ` · Peak Cut #${app.flipbook.peakCutIdx + 1}` : "";
+  app.statusNote = `Loaded ${picked.length}-frame Flipbook @ ${fps} fps (${totalDurationS().toFixed(2)}s)${cutMsg}`;
+  renderUI();
+
+  if (app.fasConnected) {
+    startPlayback(0);
+  } else {
+    synthesizeOfflineWav({ autoDownload: false, autoPlay: true });
+  }
 }
 
 function syncFasConfigFromUI() {
@@ -973,7 +1174,7 @@ function syncFasConfigFromUI() {
   app.fasCfg.method = parseInt($("fas-method").value, 10) || 0;
   app.fasCfg.stereoMode = $("fas-stereo").value || "mono";
   app.fasCfg.gain = parseFloat($("gain-input").value) || 0.12;
-  app.cfg.slotDurationS = Math.max(0.125, Math.min(10, parseFloat($("cfg-slot-s").value) || 2.0));
+  app.cfg.slotDurationS = Math.max(0.04, Math.min(10, parseFloat($("cfg-slot-s").value) || 2.0));
   app.cfg.condMode = $("cfg-cond").value || "raw";
   app.clips.forEach((c) => { c.condMode = app.cfg.condMode; });
 
@@ -985,15 +1186,13 @@ function syncFasConfigFromUI() {
 }
 
 function bindEvents() {
-  // FAS connect / live synth method / gain
   $("fas-addr").addEventListener("change", () => {
     app.fasCfg.address = $("fas-addr").value.trim() || "127.0.0.1:3003";
     localStorage.setItem("st-fas-addr", app.fasCfg.address);
   });
   $("btn-fas-connect").addEventListener("click", () => {
-    if (app.fasConnected) {
-      fas.disconnect();
-    } else {
+    if (app.fasConnected) fas.disconnect();
+    else {
       app.fasCfg.address = $("fas-addr").value.trim() || "127.0.0.1:3003";
       localStorage.setItem("st-fas-addr", app.fasCfg.address);
       fas.bank = { h: app.fasCfg.h, octaves: app.fasCfg.octaves, baseFreq: app.fasCfg.baseFreq, floatData: false };
@@ -1006,10 +1205,46 @@ function bindEvents() {
     fas.setSynthMethod(app.fasCfg.method);
     renderUI();
   });
-  $("fas-stereo").addEventListener("change", () => {
-    app.fasCfg.stereoMode = $("fas-stereo").value;
-  });
+  $("fas-stereo").addEventListener("change", () => { app.fasCfg.stereoMode = $("fas-stereo").value; });
   $("btn-apply-cfg").addEventListener("click", syncFasConfigFromUI);
+
+  // Flipbook / Sequence controls
+  $("btn-import-seq").addEventListener("click", () => $("file-seq").click());
+  $("file-seq").addEventListener("change", (ev) => {
+    if (ev.target.files.length) importFlipbookSequence(ev.target.files);
+    ev.target.value = "";
+  });
+  $("seq-fps").addEventListener("change", () => {
+    const fps = parseFloat($("seq-fps").value) || 8;
+    app.cfg.slotDurationS = Number((1.0 / fps).toFixed(4));
+    markDirty(`Set Flipbook rate to ${fps} fps (${app.cfg.slotDurationS}s/frame)`);
+  });
+  $("seq-synth-src").addEventListener("change", () => {
+    app.flipbook.synthSource = $("seq-synth-src").value;
+    markDirty(`Audio Synth Source → ${app.flipbook.synthSource.toUpperCase()}`);
+  });
+  $("seq-trail").addEventListener("change", () => {
+    app.flipbook.trailDecay = parseFloat($("seq-trail").value) || 0;
+    markDirty(`Phosphor trail decay → ${app.flipbook.trailDecay}`);
+  });
+  $("seq-chroma-blue").addEventListener("change", () => {
+    app.flipbook.chromaBlue = $("seq-chroma-blue").checked;
+    app.statusNote = app.flipbook.chromaBlue ? "Chroma → FAS Blue timbre ON" : "Chroma → FAS Blue OFF";
+    renderUI();
+  });
+  $("btn-jump-cut").addEventListener("click", () => {
+    if (app.flipbook.peakCutIdx > 0) {
+      app.selectedClipIdx = app.flipbook.peakCutIdx;
+      const t = app.flipbook.peakCutIdx * (Number(app.cfg.slotDurationS) || 0.125);
+      app.playOffset = t;
+      if (app.playing) startPlayback(t);
+      renderUI();
+    }
+  });
+  $("btn-vres-toggle").addEventListener("click", () => {
+    app.flipbook.hiResMode = !app.flipbook.hiResMode;
+    renderUI();
+  });
 
   $("btn-import-media").addEventListener("click", () => $("file-media").click());
   $("file-media").addEventListener("change", (ev) => {
@@ -1024,7 +1259,12 @@ function bindEvents() {
     if (app.dragPayload) return;
     ev.preventDefault();
     bay.classList.remove("drag-over");
-    if (ev.dataTransfer.files.length) importFiles(ev.dataTransfer.files);
+    if (ev.dataTransfer.files.length >= 6) {
+      // Dropping 6+ files at once automatically loads as an ordered Flipbook Sequence!
+      importFlipbookSequence(ev.dataTransfer.files);
+    } else if (ev.dataTransfer.files.length) {
+      importFiles(ev.dataTransfer.files);
+    }
   });
 
   const strip = $("timeline-strip");
@@ -1078,7 +1318,7 @@ function bindEvents() {
     app.breathingEnabled = false;
     for (const fr of seq.frames) {
       const m = addMediaFromRGBA(fr.filename, fr.grid.rgba, fr.grid.width, fr.grid.height);
-      addClip(m.mediaId, fr.polarity, null);
+      addClip(m.mediaId, fr.polarity, null, true);
     }
     app.breathingEnabled = breathing;
     app.selectedClipIdx = 0;
@@ -1086,11 +1326,8 @@ function bindEvents() {
     app.monMode = andPlay ? "video" : "timeline";
     markDirty(`Staged ${seq.frames.length}-frame Tri→Cir→Tri→Sq morph @ ${seq.bpm} BPM (${seq.slotDurationS}s/frame)`);
     if (andPlay) {
-      if (app.fasConnected) {
-        startPlayback(0);
-      } else {
-        synthesizeOfflineWav({ autoDownload: false });
-      }
+      if (app.fasConnected) startPlayback(0);
+      else synthesizeOfflineWav({ autoDownload: false, autoPlay: true });
     }
   }
 
@@ -1109,7 +1346,7 @@ function bindEvents() {
       app.breathingEnabled = false;
       for (const card of cards) {
         const m = addMediaFromRGBA(card.filename, card.grid.rgba, card.grid.width, card.grid.height);
-        addClip(m.mediaId, card.polarity, null);
+        addClip(m.mediaId, card.polarity, null, true);
       }
       app.breathingEnabled = true;
       app.selectedSeamIdx = 0;
@@ -1136,15 +1373,15 @@ function bindEvents() {
     renderUI();
   });
 
-  $("btn-render").addEventListener("click", () => synthesizeOfflineWav({ autoDownload: false }));
-  $("btn-export-wav2").addEventListener("click", () => synthesizeOfflineWav({ autoDownload: true }));
+  $("btn-render").addEventListener("click", () => synthesizeOfflineWav({ autoDownload: false, autoPlay: false }));
+  $("btn-export-wav2").addEventListener("click", () => synthesizeOfflineWav({ autoDownload: true, autoPlay: false }));
   $("btn-export-strip").addEventListener("click", exportStitchedStripPng);
   $("btn-export-json").addEventListener("click", downloadTimelineJSON);
 
   document.querySelectorAll(".mon-tab").forEach((btn) => {
     btn.addEventListener("click", () => { app.monMode = btn.dataset.mon; renderUI(); });
   });
-  document.querySelectorAll(".vmode-btn").forEach((btn) => {
+  document.querySelectorAll(".vmode-btn[data-vmode]").forEach((btn) => {
     btn.addEventListener("click", () => { app.videoMode = btn.dataset.vmode; renderUI(); });
   });
   document.querySelectorAll(".dock-tab").forEach((btn) => {
@@ -1197,7 +1434,7 @@ function seedStarterMedia() {
   app.breathingEnabled = false;
   for (const card of cards) {
     const m = addMediaFromRGBA(card.filename, card.grid.rgba, card.grid.width, card.grid.height);
-    addClip(m.mediaId, card.polarity, null);
+    addClip(m.mediaId, card.polarity, null, true);
   }
   app.breathingEnabled = true;
 
@@ -1208,7 +1445,7 @@ function seedStarterMedia() {
   addMediaFromRGBA("geometric_test.png", geo.rgba, geo.width, geo.height);
 
   app.monMode = "timeline";
-  markDirty("Connect local fas.exe (ws://127.0.0.1:3003) & press Space to stream 512 native oscillators live");
+  markDirty("Drop dbzframexz/*.png into Flipbook / Sequence or connect fas.exe (ws://127.0.0.1:3003)");
 }
 
 bindEvents();
